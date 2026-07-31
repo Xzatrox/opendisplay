@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OpenDisplay Windows Sender — Main Application Window -->
+<Window
+    x:Class="OpenDisplay.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:OpenDisplay"
+    Title="OpenDisplay"
+    Width="480"
+    Height="600">
+
+    <Grid Padding="24" RowSpacing="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- Header with app title and session state -->
+        <StackPanel Grid.Row="0" Spacing="4">
+            <TextBlock Text="OpenDisplay" Style="{StaticResource TitleTextBlockStyle}"/>
+            <TextBlock x:Name="SessionStateText"
+                       Text="Idle"
+                       Style="{StaticResource CaptionTextBlockStyle}"
+                       Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}"/>
+        </StackPanel>
+
+        <!-- Connection picker (discovered devices list) -->
+        <local:ConnectionPicker Grid.Row="1" x:Name="ConnectionPickerControl"/>
+
+        <!-- Quality preset selector -->
+        <StackPanel Grid.Row="2" Spacing="8">
+            <TextBlock Text="Quality" Style="{StaticResource BodyStrongTextBlockStyle}"/>
+            <ComboBox x:Name="QualityComboBox"
+                      HorizontalAlignment="Stretch"
+                      SelectionChanged="OnQualitySelectionChanged">
+                <ComboBoxItem Content="Best (18 Mbps)" Tag="best"/>
+                <ComboBoxItem Content="Balanced (10 Mbps)" Tag="balanced" IsSelected="True"/>
+                <ComboBoxItem Content="Fast (6 Mbps)" Tag="fast"/>
+            </ComboBox>
+        </StackPanel>
+
+        <!-- Error message area -->
+        <InfoBar x:Name="ErrorInfoBar"
+                 Grid.Row="3"
+                 IsOpen="False"
+                 Severity="Error"
+                 Title="Error"
+                 IsClosable="True"/>
+    </Grid>
+</Window>

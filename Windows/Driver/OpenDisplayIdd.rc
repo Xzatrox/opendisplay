@@ -1,0 +1,46 @@
+// ─── OpenDisplay IDD Virtual Display Driver — Version Resource ───────────────
+//
+// OpenDisplayIdd.rc — Embeds version information into the driver binary.
+// This resource is compiled and linked into OpenDisplayIdd.dll.
+
+#include <windows.h>
+
+#define VER_FILEVERSION             1,0,0,0
+#define VER_FILEVERSION_STR         "1.0.0.0\0"
+#define VER_PRODUCTVERSION          1,0,0,0
+#define VER_PRODUCTVERSION_STR      "1.0.0.0\0"
+#define VER_COMPANYNAME_STR         "OpenDisplay\0"
+#define VER_FILEDESCRIPTION_STR     "OpenDisplay IDD Virtual Display Driver\0"
+#define VER_INTERNALNAME_STR        "OpenDisplayIdd\0"
+#define VER_LEGALCOPYRIGHT_STR      "Copyright (c) 2024 OpenDisplay Contributors\0"
+#define VER_ORIGINALFILENAME_STR    "OpenDisplayIdd.dll\0"
+#define VER_PRODUCTNAME_STR         "OpenDisplay\0"
+
+VS_VERSION_INFO VERSIONINFO
+    FILEVERSION     VER_FILEVERSION
+    PRODUCTVERSION  VER_PRODUCTVERSION
+    FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+    FILEFLAGS       0
+    FILEOS          VOS_NT_WINDOWS32
+    FILETYPE        VFT_DRV
+    FILESUBTYPE     VFT2_DRV_DISPLAY
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      VER_COMPANYNAME_STR
+            VALUE "FileDescription",  VER_FILEDESCRIPTION_STR
+            VALUE "FileVersion",      VER_FILEVERSION_STR
+            VALUE "InternalName",     VER_INTERNALNAME_STR
+            VALUE "LegalCopyright",   VER_LEGALCOPYRIGHT_STR
+            VALUE "OriginalFilename", VER_ORIGINALFILENAME_STR
+            VALUE "ProductName",      VER_PRODUCTNAME_STR
+            VALUE "ProductVersion",   VER_PRODUCTVERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END

@@ -1,0 +1,88 @@
+;
+; OpenDisplayIdd.inf — Installation manifest for the OpenDisplay IDD
+; (Indirect Display Driver) virtual display driver.
+;
+; This is a UMDF driver using the IddCx framework to create virtual monitors
+; on Windows 11. It must be test-signed for development or production-signed
+; with an EV certificate for distribution.
+;
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGuid   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+CatalogFile = OpenDisplayIdd.cat
+DriverVer   = 01/01/2024,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = OpenDisplayIdd_Install, Root\OpenDisplayIdd
+
+; ─── Install Section ──────────────────────────────────────────────────────────
+
+[OpenDisplayIdd_Install]
+; No CopyFiles needed — UMDF driver DLL is handled by the WDF co-installer
+
+[OpenDisplayIdd_Install.HW]
+AddReg = OpenDisplayIdd_HW_AddReg
+
+[OpenDisplayIdd_HW_AddReg]
+; Device interface GUID for user-mode app communication
+HKR,,DeviceInterfaceGUIDs,0x10000,"{E4F3C5A1-7B2D-4F8A-9C1E-6D3A5B8F2E70}"
+
+; ─── Service Installation ─────────────────────────────────────────────────────
+
+[OpenDisplayIdd_Install.Services]
+AddService = WUDFRd,0x000001fa,WUDFRD_ServiceInstall
+
+[WUDFRD_ServiceInstall]
+DisplayName = %ServiceName%
+ServiceType = 1
+StartType   = 3
+ErrorControl = 1
+ServiceBinary = %12%\WUDFRd.sys
+
+; ─── WDF (UMDF) Configuration ────────────────────────────────────────────────
+
+[OpenDisplayIdd_Install.Wdf]
+UmdfService      = OpenDisplayIdd,OpenDisplayIdd_UmdfConfig
+UmdfServiceOrder = OpenDisplayIdd
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfIddCxClient  = IddCxStub
+
+[OpenDisplayIdd_UmdfConfig]
+UmdfLibraryVersion = 2.31.0
+ServiceBinary      = %13%\OpenDisplayIdd.dll
+
+; ─── Device Co-installer (IddCx) ─────────────────────────────────────────────
+
+[OpenDisplayIdd_Install.CoInstallers]
+AddReg = CoInstaller_AddReg
+
+[CoInstaller_AddReg]
+HKR,,CoInstallers32,0x00010000,"WUDFCoinstaller.dll"
+
+; ─── Source Disks ─────────────────────────────────────────────────────────────
+
+[SourceDisksFiles]
+OpenDisplayIdd.dll = 1
+
+[SourceDisksNames]
+1 = %DiskName%
+
+; ─── Destination Directories ──────────────────────────────────────────────────
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+; ─── Strings ──────────────────────────────────────────────────────────────────
+
+[Strings]
+ManufacturerName = "OpenDisplay"
+DeviceName       = "OpenDisplay Virtual Display Adapter"
+ServiceName      = "OpenDisplay IDD Service"
+DiskName         = "OpenDisplay IDD Installation Disk"
