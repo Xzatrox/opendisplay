@@ -89,6 +89,9 @@ final class MacReceiver: ObservableObject {
         pps = nil
         connected = false
         status = "Stopped"
+        receiverWindow?.close()
+        receiverWindow = nil
+        renderer = nil
     }
 
     // MARK: - Listener setup
@@ -244,10 +247,11 @@ final class MacReceiver: ObservableObject {
         self.vps = nil
         self.isHevc = false
         self.decodeErrorCount = 0
-        DispatchQueue.main.async {
-            self.connected = false
-            self.status = "Connection lost — waiting for sender…"
-        }
+        connected = false
+        status = "Connection lost — waiting for sender…"
+        receiverWindow?.close()
+        receiverWindow = nil
+        renderer = nil
         // The listener continues advertising; a new connection will be
         // accepted automatically via newConnectionHandler.
         Log.info("MacReceiver: connection lost, continuing to advertise")
@@ -642,26 +646,36 @@ final class MacReceiver: ObservableObject {
 
     /// Install the Metal layer into the key window for full-screen display.
     /// Called on main thread.
+    private var receiverWindow: NSWindow?
+
     private func installRendererLayer(_ layer: CAMetalLayer) {
-        // The hosting view/window setup is managed by the app's SwiftUI/AppKit
-        // layer. Here we attach the Metal layer to the existing content view
-        // if available. The app is expected to provide a receiver window.
-        guard let window = NSApp.keyWindow ?? NSApp.windows.first,
-              let contentView = window.contentView else {
-            Log.info("MacReceiver: no window available for renderer layer")
-            return
+        if receiverWindow == nil {
+            let screen = NSScreen.main ?? NSScreen.screens.first
+            let frame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+            let w = NSWindow(
+                contentRect: frame,
+                styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
+                backing: .buffered,
+                defer: false)
+            w.title = "OpenDisplay — Receiver"
+            w.backgroundColor = .black
+            w.isReleasedWhenClosed = false
+            w.collectionBehavior = [.fullScreenPrimary]
+            w.makeKeyAndOrderFront(nil)
+            w.toggleFullScreen(nil)
+            receiverWindow = w
         }
+        guard let window = receiverWindow,
+              let contentView = window.contentView else { return }
         contentView.wantsLayer = true
         if let hostLayer = contentView.layer {
             layer.frame = hostLayer.bounds
             layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            hostLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
             hostLayer.addSublayer(layer)
-            Log.info("MacReceiver: renderer layer installed in window")
+            Log.info("MacReceiver: renderer layer installed (\(Int(hostLayer.bounds.width))x\(Int(hostLayer.bounds.height)))")
         }
-        // Attach input handler to the rendering window so mouse/trackpad
-        // events are captured and forwarded to the sender.
         inputHandler.attach(to: window)
-        Log.info("MacReceiver: input handler attached to receiver window")
     }
 
     // MARK: - Keyframe Request
