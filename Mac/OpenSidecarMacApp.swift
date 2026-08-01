@@ -21,13 +21,14 @@ enum AppPresentation: String, CaseIterable {
 struct OpenSidecarMacApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var controller = SenderController.shared
+    @StateObject private var receiverController = ReceiverController.shared
 
     var body: some Scene {
         MenuBarExtra(isInserted: Binding(
             get: { controller.presentation == .menuBar },
             set: { _ in }
         )) {
-            ContentView(controller: controller, updater: appDelegate.updater)
+            ContentView(controller: controller, receiverController: receiverController, updater: appDelegate.updater)
         } label: {
             Image(systemName: controller.running
                   ? "rectangle.on.rectangle.fill" : "rectangle.on.rectangle")
@@ -76,12 +77,13 @@ enum MainWindow {
     static func show() {
         if window == nil {
             let w = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 440, height: 540),
+                contentRect: NSRect(x: 0, y: 0, width: 440, height: 580),
                 styleMask: [.titled, .closable, .miniaturizable],
                 backing: .buffered, defer: false)
             w.title = "OpenDisplay"
             w.contentView = NSHostingView(
                 rootView: ContentView(controller: SenderController.shared,
+                                      receiverController: ReceiverController.shared,
                                       updater: updater))
             w.isReleasedWhenClosed = false
             w.center()
@@ -90,6 +92,19 @@ enum MainWindow {
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
+}
+
+/// Wraps MacReceiver for the UI — start/stop and status publishing.
+@MainActor
+final class ReceiverController: ObservableObject {
+    static let shared = ReceiverController()
+    private let receiver = MacReceiver()
+
+    @Published var enabled: Bool = false {
+        didSet { if enabled { receiver.start() } else { receiver.stop() } }
+    }
+    var status: String { receiver.status }
+    var connected: Bool { receiver.connected }
 }
 
 enum ConnectionTarget: Hashable {
@@ -747,6 +762,7 @@ final class PermissionMonitor: ObservableObject {
 
 struct ContentView: View {
     @ObservedObject var controller: SenderController
+    @ObservedObject var receiverController: ReceiverController
     @StateObject private var permissions = PermissionMonitor()
     // Optional so the view still compiles/previews without an updater (e.g.
     // if Sparkle ever fails to start); the button just disables itself then.
@@ -778,6 +794,20 @@ struct ContentView: View {
 
             // Settings
             Form {
+                Section("Mac as Display (for Windows)") {
+                    Toggle("Receive from Windows PC", isOn: $receiverController.enabled)
+                    if receiverController.enabled {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(receiverController.connected ? Color.green : Color.orange)
+                                .frame(width: 9, height: 9)
+                            Text(receiverController.status)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
                 Section("Devices") {
                     if controller.deviceEntries.isEmpty {
                         Text("No devices found — plug one in via USB, or open the OpenDisplay app on a device on this WiFi network.")
@@ -909,7 +939,7 @@ struct ContentView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
         }
-        .frame(width: 440, height: 540)
+        .frame(width: 440, height: 580)
     }
 
     @ViewBuilder
