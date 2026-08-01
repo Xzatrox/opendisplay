@@ -120,44 +120,15 @@ int WINAPI WinMain(
                 wifiDevices.push_back(std::move(info));
             }
             picker.UpdateWiFiDevices(wifiDevices);
+            mainWindow.NotifyDevicesChanged();
         });
 
     // Wire AMDS device attach/detach events to the connection picker and session
     HRESULT amdsHr = amdsClient->Connect();
     if (SUCCEEDED(amdsHr)) {
-        amdsClient->Subscribe(
-            [&mainWindow, &sessionController](const AmdsClient::Device& device, bool attached) {
-                DeviceInfo info;
-                info.name = device.name;
-                info.udid = device.udid;
-                info.isUSB = true;
-                info.port = 9000;
-
-                auto& picker = mainWindow.GetConnectionPicker();
-                if (attached) {
-                    picker.AddUSBDevice(info);
-                    // Notify session controller for auto-connect
-                    sessionController->OnUSBDeviceAttached(info);
-                } else {
-                    picker.RemoveUSBDevice(info.udid);
-                    // Notify session controller for WiFi failover
-                    sessionController->OnUSBDeviceDetached(device.udid);
-                }
-            });
-    } else {
-        // AMDS unavailable — show message to install iTunes/Apple Devices
-        mainWindow.ShowError("USB Not Available",
-            "Apple Mobile Device Service not found. "
-            "Install iTunes or Apple Devices from the Microsoft Store "
-            "to connect iPad via USB.");
-    }
-
-    // ── Step 7: Start discovery services ─────────────────────────────────────
-
-    bonjourBrowser->StartBrowsing();
-
-    // Enumerate initially-attached USB devices
-    if (amdsClient->IsAvailable()) {
+        // Enumerate initially-attached USB devices BEFORE Subscribe(),
+        // because Subscribe() takes over the connection for async event
+        // reading and ListDevices() cannot share the same pipe/socket.
         std::vector<AmdsClient::Device> existingDevices;
         if (SUCCEEDED(amdsClient->ListDevices(existingDevices))) {
             auto& picker = mainWindow.GetConnectionPicker();
@@ -170,7 +141,39 @@ int WINAPI WinMain(
                 picker.AddUSBDevice(info);
             }
         }
+
+        // Now subscribe for future attach/detach events.
+        // This takes over the AMDS connection — no further ListDevices
+        // calls should be made on this client instance.
+        amdsClient->Subscribe(
+            [&mainWindow, &sessionController](const AmdsClient::Device& device, bool attached) {
+                DeviceInfo info;
+                info.name = device.name;
+                info.udid = device.udid;
+                info.isUSB = true;
+                info.port = 9000;
+
+                auto& picker = mainWindow.GetConnectionPicker();
+                if (attached) {
+                    picker.AddUSBDevice(info);
+                    sessionController->OnUSBDeviceAttached(info);
+                } else {
+                    picker.RemoveUSBDevice(info.udid);
+                    sessionController->OnUSBDeviceDetached(device.udid);
+                }
+                mainWindow.NotifyDevicesChanged();
+            });
+    } else {
+        // AMDS unavailable — show message to install iTunes/Apple Devices
+        mainWindow.ShowError("USB Not Available",
+            "Apple Mobile Device Service not found. "
+            "Install iTunes or Apple Devices from the Microsoft Store "
+            "to connect iPad via USB.");
     }
+
+    // ── Step 7: Start discovery services ─────────────────────────────────────
+
+    bonjourBrowser->StartBrowsing();
 
     // ── Step 8: Show window and run message loop ─────────────────────────────
 

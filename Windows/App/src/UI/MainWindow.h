@@ -57,6 +57,9 @@ public:
     ConnectionPicker& GetConnectionPicker() { return m_connectionPicker; }
     const ConnectionPicker& GetConnectionPicker() const { return m_connectionPicker; }
 
+    /// Notify the window that the device list has changed (triggers UI refresh).
+    void NotifyDevicesChanged();
+
 private:
     /// Window procedure callback.
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

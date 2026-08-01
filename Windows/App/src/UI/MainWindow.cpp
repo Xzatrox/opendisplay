@@ -1,6 +1,6 @@
 // OpenDisplay Windows Sender — Main Window Implementation
 // Hosts the connection picker, quality preset selector, session state indicator,
-// and error message display.
+// and error message display using Win32 child controls.
 //
 // Validates: Requirements 10.1, 10.2
 
@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <cassert>
+#include <commctrl.h>
+
+#pragma comment(lib, "comctl32.lib")
 
 namespace OpenDisplay {
 
@@ -17,6 +20,16 @@ static constexpr const wchar_t* kWindowClassName = L"OpenDisplayMainWindow";
 // Custom message IDs for cross-thread UI updates
 static constexpr UINT WM_SESSION_STATE_CHANGED = WM_USER + 1;
 static constexpr UINT WM_SHOW_ERROR = WM_USER + 2;
+static constexpr UINT WM_DEVICES_CHANGED = WM_USER + 3;
+
+// Child control IDs
+static constexpr int IDC_STATUS_LABEL = 101;
+static constexpr int IDC_DEVICE_LIST = 102;
+static constexpr int IDC_QUALITY_COMBO = 103;
+static constexpr int IDC_CONNECT_BTN = 104;
+static constexpr int IDC_DISCONNECT_BTN = 105;
+static constexpr int IDC_DEVICES_LABEL = 106;
+static constexpr int IDC_QUALITY_LABEL = 107;
 
 MainWindow::MainWindow() = default;
 
@@ -29,6 +42,12 @@ MainWindow::~MainWindow() {
 
 HRESULT MainWindow::Initialize(HINSTANCE hInstance) {
     m_hInstance = hInstance;
+
+    // Enable visual styles (common controls v6)
+    INITCOMMONCONTROLSEX icc = {};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_STANDARD_CLASSES;
+    InitCommonControlsEx(&icc);
 
     // Register window class
     WNDCLASSEXW wc = {};
@@ -54,7 +73,7 @@ HRESULT MainWindow::Initialize(HINSTANCE hInstance) {
         L"OpenDisplay",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        480, 600,
+        480, 520,
         nullptr,
         nullptr,
         hInstance,
@@ -64,6 +83,71 @@ HRESULT MainWindow::Initialize(HINSTANCE hInstance) {
     if (!m_hwnd) {
         return HRESULT_FROM_WIN32(GetLastError());
     }
+
+    // Get the default GUI font
+    HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+
+    // --- Create child controls ---
+
+    // Status label (top)
+    HWND hStatus = CreateWindowExW(0, L"STATIC", L"Status: Idle",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        20, 15, 430, 20, m_hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS_LABEL)),
+        hInstance, nullptr);
+    SendMessage(hStatus, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // "Devices" label
+    HWND hDevLabel = CreateWindowExW(0, L"STATIC", L"Devices:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        20, 45, 430, 18, m_hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DEVICES_LABEL)),
+        hInstance, nullptr);
+    SendMessage(hDevLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Device listbox
+    HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+        20, 65, 430, 220, m_hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DEVICE_LIST)),
+        hInstance, nullptr);
+    SendMessage(hList, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // "Quality" label
+    HWND hQualLabel = CreateWindowExW(0, L"STATIC", L"Quality:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        20, 300, 60, 20, m_hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_QUALITY_LABEL)),
+        hInstance, nullptr);
+    SendMessage(hQualLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Quality combo box
+    HWND hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+        85, 297, 200, 120, m_hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_QUALITY_COMBO)),
+        hInstance, nullptr);
+    SendMessage(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Best (18 Mbps)");
+    SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Balanced (10 Mbps)");
+    SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Fast (6 Mbps)");
+    SendMessageW(hCombo, CB_SETCURSEL, 1, 0); // Default: balanced
+
+    // Connect button
+    HWND hConnect = CreateWindowExW(0, L"BUTTON", L"Connect",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        20, 340, 210, 35, m_hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CONNECT_BTN)),
+        hInstance, nullptr);
+    SendMessage(hConnect, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Disconnect button
+    HWND hDisconnect = CreateWindowExW(0, L"BUTTON", L"Disconnect",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+        240, 340, 210, 35, m_hwnd,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DISCONNECT_BTN)),
+        hInstance, nullptr);
+    SendMessage(hDisconnect, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     // Wire up the connection picker's connect callback
     m_connectionPicker.SetConnectCallback(
@@ -78,6 +162,14 @@ void MainWindow::Show() {
     if (m_hwnd) {
         ShowWindow(m_hwnd, SW_SHOW);
         UpdateWindow(m_hwnd);
+        // Trigger initial device list refresh
+        PostMessage(m_hwnd, WM_DEVICES_CHANGED, 0, 0);
+    }
+}
+
+void MainWindow::NotifyDevicesChanged() {
+    if (m_hwnd) {
+        PostMessage(m_hwnd, WM_DEVICES_CHANGED, 0, 0);
     }
 }
 
@@ -203,16 +295,60 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             PostQuitMessage(0);
             return 0;
 
-        case WM_SESSION_STATE_CHANGED:
-            // UI update for session state change — in a full WinUI 3 app this
-            // would update the SessionStateText TextBlock. For the Win32 fallback,
-            // we invalidate to trigger a repaint.
-            InvalidateRect(m_hwnd, nullptr, TRUE);
+        case WM_COMMAND: {
+            int controlId = LOWORD(wParam);
+            int notifyCode = HIWORD(wParam);
+
+            if (controlId == IDC_CONNECT_BTN && notifyCode == BN_CLICKED) {
+                // Get selected device from listbox
+                HWND hList = GetDlgItem(m_hwnd, IDC_DEVICE_LIST);
+                int sel = (int)SendMessage(hList, LB_GETCURSEL, 0, 0);
+                if (sel == LB_ERR) {
+                    MessageBoxW(m_hwnd, L"Select a device first.",
+                               L"OpenDisplay", MB_OK | MB_ICONINFORMATION);
+                    return 0;
+                }
+                // Get quality selection
+                HWND hCombo = GetDlgItem(m_hwnd, IDC_QUALITY_COMBO);
+                int qualIdx = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+                OnQualitySelectionChanged(qualIdx);
+
+                // Get device from picker's display list
+                auto devices = m_connectionPicker.GetDisplayList();
+                if (sel >= 0 && sel < static_cast<int>(devices.size())) {
+                    OnConnectRequested(devices[sel]);
+                }
+            }
+            else if (controlId == IDC_DISCONNECT_BTN && notifyCode == BN_CLICKED) {
+                OnDisconnectRequested();
+            }
+            else if (controlId == IDC_QUALITY_COMBO && notifyCode == CBN_SELCHANGE) {
+                HWND hCombo = GetDlgItem(m_hwnd, IDC_QUALITY_COMBO);
+                int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
+                OnQualitySelectionChanged(sel);
+            }
             return 0;
+        }
+
+        case WM_SESSION_STATE_CHANGED: {
+            // Update status label
+            HWND hStatus = GetDlgItem(m_hwnd, IDC_STATUS_LABEL);
+            std::string text = "Status: " + StateToString(m_currentState);
+            if (!m_currentStatus.empty()) {
+                text += " - " + m_currentStatus;
+            }
+            std::wstring wtext(text.begin(), text.end());
+            SetWindowTextW(hStatus, wtext.c_str());
+
+            // Enable/disable buttons based on state
+            bool isActive = (m_currentState != SessionController::State::Idle &&
+                             m_currentState != SessionController::State::Ended);
+            EnableWindow(GetDlgItem(m_hwnd, IDC_CONNECT_BTN), !isActive);
+            EnableWindow(GetDlgItem(m_hwnd, IDC_DISCONNECT_BTN), isActive);
+            return 0;
+        }
 
         case WM_SHOW_ERROR:
-            // In a full WinUI 3 app this would open the InfoBar.
-            // For Win32 fallback, show a message box.
             if (m_errorVisible) {
                 std::wstring title(m_errorTitle.begin(), m_errorTitle.end());
                 std::wstring message(m_errorMessage.begin(), m_errorMessage.end());
@@ -221,8 +357,29 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
+        case WM_DEVICES_CHANGED: {
+            // Rebuild the listbox content from the connection picker
+            HWND hList = GetDlgItem(m_hwnd, IDC_DEVICE_LIST);
+            SendMessage(hList, LB_RESETCONTENT, 0, 0);
+            auto devices = m_connectionPicker.GetDisplayList();
+            for (const auto& dev : devices) {
+                std::string label = dev.name;
+                if (dev.isUSB) label += "  [USB]";
+                else label += "  [WiFi]";
+                std::wstring wlabel(label.begin(), label.end());
+                SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)wlabel.c_str());
+            }
+            if (devices.empty()) {
+                SendMessageW(hList, LB_ADDSTRING, 0,
+                    (LPARAM)L"  (No devices found - connect iPad via USB or check WiFi)");
+                EnableWindow(hList, FALSE);
+            } else {
+                EnableWindow(hList, TRUE);
+            }
+            return 0;
+        }
+
         case WM_CLOSE:
-            // Initiate graceful shutdown
             OnDisconnectRequested();
             DestroyWindow(m_hwnd);
             return 0;
