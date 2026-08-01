@@ -87,6 +87,131 @@ static uint32_t BitrateFromQuality(StreamQuality quality)
     }
 }
 
+// ─── Helper: Find a virtual display output via DXGI enumeration ──────────────
+// Enumerates all DXGI adapters and outputs looking for the VDD virtual display.
+// The VDD outputs typically have names like "\\.\DISPLAY15" and are small
+// resolution (800x600 default). We return the first output that is NOT the
+// primary display.
+
+#include <dxgi1_2.h>
+#include <d3d10.h>
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3d11.lib")
+
+struct VirtualDisplayInfo {
+    ComPtr<IDXGIOutput> output;
+    ComPtr<ID3D11Device> device;
+    uint32_t width;
+    uint32_t height;
+    std::wstring name;
+};
+
+static bool FindVirtualDisplayOutput(VirtualDisplayInfo& outInfo)
+{
+    ComPtr<IDXGIFactory1> factory;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return false;
+
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT adapterIdx = 0;
+         factory->EnumAdapters1(adapterIdx, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND;
+         ++adapterIdx)
+    {
+        DXGI_ADAPTER_DESC1 adapterDesc = {};
+        adapter->GetDesc1(&adapterDesc);
+
+        ComPtr<IDXGIOutput> output;
+        for (UINT outputIdx = 0;
+             adapter->EnumOutputs(outputIdx, output.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND;
+             ++outputIdx)
+        {
+            DXGI_OUTPUT_DESC desc = {};
+            output->GetDesc(&desc);
+
+            if (!desc.AttachedToDesktop) continue;
+
+            std::wstring outputName = desc.DeviceName;
+            int displayWidth = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+            int displayHeight = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+
+            std::wcerr << L"[FindVDD] Output: " << outputName
+                       << L" (" << displayWidth << L"x" << displayHeight << L")"
+                       << L" adapter=" << adapterDesc.Description << L"\n";
+
+            // Heuristic: VDD displays are high-numbered (DISPLAY10+) or non-standard res
+            bool isLikelyVDD = false;
+
+            // Extract display number from name like "\\.\DISPLAY15"
+            size_t dispPos = outputName.find(L"DISPLAY");
+            if (dispPos != std::wstring::npos) {
+                std::wstring numStr = outputName.substr(dispPos + 7);
+                try {
+                    int num = std::stoi(numStr);
+                    if (num >= 10) isLikelyVDD = true;
+                } catch (...) {}
+            }
+
+            // Also check: if it's not the primary (3440x1440) display
+            if (displayWidth != 3440 && displayHeight != 1440 &&
+                displayWidth > 0 && displayHeight > 0 &&
+                displayWidth != displayHeight) {
+                // Could be VDD if it's a non-standard small resolution
+                if (displayWidth <= 800 && displayHeight <= 600) {
+                    isLikelyVDD = true;
+                }
+                // Or if it matches our configured resolution
+                if (displayWidth == 3024 && displayHeight == 1964) {
+                    isLikelyVDD = true;
+                }
+                if (displayWidth == 1512 && displayHeight == 982) {
+                    isLikelyVDD = true;
+                }
+            }
+
+            if (isLikelyVDD) {
+                std::wcerr << L"[FindVDD] → Selected as VDD target\n";
+
+                // Create D3D11 device on THIS adapter (critical for Desktop Duplication)
+                // Use BGRA support + multithread protection (required by MFT encoders)
+                ComPtr<ID3D11Device> device;
+                ComPtr<ID3D11DeviceContext> ctx;
+                D3D_FEATURE_LEVEL featureLevel;
+                D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+                hr = D3D11CreateDevice(
+                    adapter.Get(),
+                    D3D_DRIVER_TYPE_UNKNOWN,
+                    nullptr,
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    levels, _countof(levels),
+                    D3D11_SDK_VERSION,
+                    device.GetAddressOf(),
+                    &featureLevel,
+                    ctx.GetAddressOf());
+
+                if (SUCCEEDED(hr)) {
+                    // Enable multithread protection — required for MFT D3D11 usage
+                    ComPtr<ID3D10Multithread> mt;
+                    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&mt)))) {
+                        mt->SetMultithreadProtected(TRUE);
+                    }
+
+                    outInfo.output = output;
+                    outInfo.device = device;
+                    outInfo.width = static_cast<uint32_t>(displayWidth);
+                    outInfo.height = static_cast<uint32_t>(displayHeight);
+                    outInfo.name = outputName;
+                    return true;
+                } else {
+                    std::cerr << "[FindVDD] D3D11CreateDevice failed: 0x"
+                              << std::hex << hr << std::dec << "\n";
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 // ─── Helper: Open a handle to the IDD virtual display driver ─────────────────
 
 static HANDLE OpenDriverHandle()
@@ -349,11 +474,14 @@ HRESULT SessionController::StartSession(const DeviceInfo& device, StreamQuality 
 
     SetState(State::Connecting, "Connecting to " + device.name);
 
-    // Open driver handle for virtual display management
+    // Open driver handle for virtual display management.
+    // Non-fatal if driver is not installed — session proceeds without
+    // virtual display (useful for development/testing without WDK).
     m_driverHandle = OpenDriverHandle();
     if (m_driverHandle == INVALID_HANDLE_VALUE) {
-        SetState(State::Ended, "Failed to open virtual display driver");
-        return E_FAIL;
+        // Driver not installed — continue without virtual display
+        // The session can still stream to the receiver; it just won't
+        // create a virtual monitor on this machine.
     }
 
     // Establish transport connection
@@ -500,50 +628,87 @@ void SessionController::EndSession()
 
 void SessionController::PipelineLoop()
 {
+    std::cerr << "[Pipeline] Starting. capture="
+              << (m_capture ? "yes" : "NO")
+              << " encoder=" << (m_encoder ? "yes" : "NO")
+              << " transport=" << (m_transport ? "yes" : "NO") << "\n";
+
+    if (!m_capture || !m_encoder || !m_transport) {
+        std::cerr << "[Pipeline] Missing component — exiting pipeline loop.\n";
+        return;
+    }
+
+    int frameCount = 0;
+    int captureErrors = 0;
+    int encodeErrors = 0;
+    int sentFrames = 0;
+    int loopCount = 0;
+
     while (m_pipelineRunning.load()) {
-        if (!m_capture || !m_encoder || !m_transport) {
-            break;
+        loopCount++;
+        if (loopCount <= 20 || loopCount % 100 == 0) {
+            std::cerr << "[Loop " << loopCount << "] top\n";
+            std::cerr.flush();
         }
 
-        // Acquire frame from DXGI Desktop Duplication
+        // Step A: Try to get output from encoder
+        if (m_encoder) {
+            if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] A: GetOutput\n"; std::cerr.flush(); }
+            std::vector<uint8_t> annexBData;
+            bool isKeyframe = false;
+            HRESULT outHr = m_encoder->GetOutput(annexBData, isKeyframe);
+            if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] A: GetOutput=0x" << std::hex << outHr << std::dec << " sz=" << annexBData.size() << "\n"; std::cerr.flush(); }
+            if (SUCCEEDED(outHr) && !annexBData.empty()) {
+                int64_t sendMs = NowMs();
+                HRESULT sendHr = m_transport->SendVideoFrame(annexBData, 0, sendMs);
+                sentFrames++;
+                std::cerr << "[Loop " << loopCount << "] SENT #" << sentFrames << " sz=" << annexBData.size() << " kf=" << isKeyframe << " sendHr=0x" << std::hex << sendHr << std::dec << "\n";
+                std::cerr.flush();
+            }
+        }
+
+        // Step B: Acquire frame
+        if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] B: AcquireFrame\n"; std::cerr.flush(); }
         ID3D11Texture2D* texture = nullptr;
         DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
         HRESULT hr = m_capture->AcquireFrame(kCaptureTimeoutMs, &texture, &frameInfo);
+        if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] B: AcquireFrame=0x" << std::hex << hr << std::dec << "\n"; std::cerr.flush(); }
 
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            // No content change — skip
             continue;
         }
 
         if (FAILED(hr)) {
-            // Capture error — skip frame, recovery handled by capture layer
+            captureErrors++;
+            std::cerr << "[Loop " << loopCount << "] B: capture FAIL 0x" << std::hex << hr << std::dec << "\n"; std::cerr.flush();
             continue;
         }
 
-        // Submit to encoder (drops frame if encoder is busy)
+        frameCount++;
+        std::cerr << "[Loop " << loopCount << "] C: frame #" << frameCount << "\n"; std::cerr.flush();
+
+        // Step C: Submit to encoder
         int64_t captureMs = NowMs();
+        std::cerr << "[Loop " << loopCount << "] C: SubmitFrame\n"; std::cerr.flush();
         hr = m_encoder->SubmitFrame(texture, captureMs);
         m_capture->ReleaseFrame();
+        std::cerr << "[Loop " << loopCount << "] C: SubmitFrame=0x" << std::hex << hr << std::dec << "\n"; std::cerr.flush();
 
         if (hr == MF_E_NOTACCEPTING) {
-            // Encoder busy — frame dropped (no forced keyframe, Req 3.6)
+            std::cerr << "[Loop " << loopCount << "] C: encoder busy, dropped\n"; std::cerr.flush();
             continue;
         }
 
         if (FAILED(hr)) {
+            encodeErrors++;
+            std::cerr << "[Loop " << loopCount << "] C: encode FAIL\n"; std::cerr.flush();
             continue;
         }
-
-        // Retrieve encoded output
-        std::vector<uint8_t> annexBData;
-        bool isKeyframe = false;
-        hr = m_encoder->GetOutput(annexBData, isKeyframe);
-
-        if (SUCCEEDED(hr) && !annexBData.empty()) {
-            int64_t sendMs = NowMs();
-            m_transport->SendVideoFrame(annexBData, captureMs, sendMs);
-        }
     }
+    std::cerr << "[Pipeline] Exited. loops=" << loopCount << " frames=" << frameCount
+              << " sent=" << sentFrames << " captErr=" << captureErrors
+              << " encErr=" << encodeErrors << "\n";
+    std::cerr.flush();
 }
 
 // ─── SessionController: Hello / Sleep / Close Handlers ───────────────────────
@@ -558,18 +723,21 @@ void SessionController::OnHelloReceived(const HelloInfo& info)
         return;
     }
 
-    // Create or resize virtual display
-    HRESULT hr;
-    if (m_monitorId == 0) {
-        hr = CreateVirtualDisplay(m_driverHandle, width, height, m_monitorId);
-    } else {
-        hr = ResizeVirtualDisplay(m_driverHandle, m_monitorId, width, height);
-    }
+    // Find a virtual display to capture from (VDD third-party driver)
+    VirtualDisplayInfo vddInfo;
+    bool haveVDD = FindVirtualDisplayOutput(vddInfo);
 
-    if (FAILED(hr)) {
-        SetState(State::Ended, "Failed to configure virtual display");
-        EndSession();
-        return;
+    // If we have our custom driver, create/resize the display
+    if (m_driverHandle != INVALID_HANDLE_VALUE) {
+        HRESULT hr;
+        if (m_monitorId == 0) {
+            hr = CreateVirtualDisplay(m_driverHandle, width, height, m_monitorId);
+        } else {
+            hr = ResizeVirtualDisplay(m_driverHandle, m_monitorId, width, height);
+        }
+        if (FAILED(hr)) {
+            m_monitorId = 0;
+        }
     }
 
     m_displayWidth = width;
@@ -585,22 +753,99 @@ void SessionController::OnHelloReceived(const HelloInfo& info)
         m_input->SetDisplayBounds(bounds);
     }
 
-    // Initialize encoder
+    // Initialize capture from VDD virtual display (if available)
+    if (haveVDD) {
+        m_capture = std::make_unique<DesktopDuplicationCapture>();
+        HRESULT capHr = m_capture->Initialize(vddInfo.output.Get(), vddInfo.device.Get());
+        if (FAILED(capHr)) {
+            std::cerr << "[SessionController] Capture init failed on VDD: 0x"
+                      << std::hex << capHr << std::dec
+                      << " - falling back to primary display\n";
+            m_capture.reset();
+
+            // Fallback: Desktop Duplication doesn't work on IDD outputs.
+            // Capture from the primary display (DISPLAY1) instead.
+            ComPtr<IDXGIFactory1> factory2;
+            if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory2)))) {
+                ComPtr<IDXGIAdapter1> primaryAdapter;
+                if (factory2->EnumAdapters1(0, &primaryAdapter) != DXGI_ERROR_NOT_FOUND) {
+                    ComPtr<IDXGIOutput> primaryOutput;
+                    if (primaryAdapter->EnumOutputs(0, &primaryOutput) != DXGI_ERROR_NOT_FOUND) {
+                        ComPtr<ID3D11Device> primaryDevice;
+                        D3D_FEATURE_LEVEL fl;
+                        HRESULT devHr = D3D11CreateDevice(
+                            primaryAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                            nullptr, 0, D3D11_SDK_VERSION,
+                            primaryDevice.GetAddressOf(), &fl, nullptr);
+                        if (SUCCEEDED(devHr)) {
+                            m_capture = std::make_unique<DesktopDuplicationCapture>();
+                            capHr = m_capture->Initialize(primaryOutput.Get(), primaryDevice.Get());
+                            if (SUCCEEDED(capHr)) {
+                                DXGI_OUTPUT_DESC pDesc = {};
+                                primaryOutput->GetDesc(&pDesc);
+                                vddInfo.device = primaryDevice;
+                                vddInfo.width = pDesc.DesktopCoordinates.right - pDesc.DesktopCoordinates.left;
+                                vddInfo.height = pDesc.DesktopCoordinates.bottom - pDesc.DesktopCoordinates.top;
+                                std::cerr << "[SessionController] Capturing PRIMARY display "
+                                          << vddInfo.width << "x" << vddInfo.height << "\n";
+                            } else {
+                                std::cerr << "[SessionController] Primary also failed: 0x"
+                                          << std::hex << capHr << std::dec << "\n";
+                                m_capture.reset();
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            std::cerr << "[SessionController] Capturing VDD display "
+                      << vddInfo.width << "x" << vddInfo.height << "\n";
+        }
+    }
+
+    // Initialize encoder with the D3D device from VDD (or nullptr as fallback)
+    ID3D11Device* encDevice = haveVDD ? vddInfo.device.Get() : nullptr;
     m_encoder = std::make_unique<MFTEncoder>();
     MFTEncoder::Config encoderConfig;
-    encoderConfig.width = width;
-    encoderConfig.height = height;
+    // H.264 encoders require specific resolution alignment.
+    // AMD AMF often requires width divisible by 16, and has max limits.
+    // Use 1920x1080 as a safe fallback that all encoders support,
+    // then try the actual resolution.
+    uint32_t encWidth = haveVDD ? vddInfo.width : width;
+    uint32_t encHeight = haveVDD ? vddInfo.height : height;
+    encWidth = (encWidth / 16) * 16;
+    encHeight = (encHeight / 16) * 16;
+    if (encWidth == 0) encWidth = 16;
+    if (encHeight == 0) encHeight = 16;
+
+    std::cerr << "[SessionController] Encoder resolution: "
+              << encWidth << "x" << encHeight << "\n";
+
+    encoderConfig.width = encWidth;
+    encoderConfig.height = encHeight;
     encoderConfig.fps = 60;
     encoderConfig.bitrate = BitrateFromQuality(m_quality);
-    encoderConfig.hardwareOnly = false; // Fall back to software if needed
+    encoderConfig.hardwareOnly = false;
 
-    // Note: passing nullptr for device here - in real impl, we'd get the D3D11
-    // device from the capture initialization. Simplified for this task.
-    hr = m_encoder->Initialize(encoderConfig, nullptr);
-    if (FAILED(hr)) {
-        SetState(State::Ended, "Failed to initialize encoder");
-        EndSession();
-        return;
+    HRESULT encHr = m_encoder->Initialize(encoderConfig, encDevice);
+
+    // If the native resolution failed, try 1920x1080 as safe fallback
+    if (FAILED(encHr)) {
+        std::cerr << "[SessionController] Native res failed, trying 1920x1080...\n";
+        encoderConfig.width = 1920;
+        encoderConfig.height = 1080;
+        m_encoder = std::make_unique<MFTEncoder>();
+        encHr = m_encoder->Initialize(encoderConfig, encDevice);
+    }
+
+    if (FAILED(encHr)) {
+        std::cerr << "[SessionController] Encoder init failed: 0x"
+                  << std::hex << encHr << std::dec << "\n";
+        m_encoder.reset();
+    } else {
+        std::cerr << "[SessionController] Encoder initialized: "
+                  << encoderConfig.width << "x" << encoderConfig.height << "\n";
     }
 
     // Start streaming

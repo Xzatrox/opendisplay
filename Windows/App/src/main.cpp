@@ -8,12 +8,14 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <shellscalingapi.h>
 #include <mfapi.h>
 #include <objbase.h>
 
 #include <iostream>
 #include <memory>
 #include <string>
+#include <cstdio>
 
 #include "BonjourBrowser.h"
 #include "SessionController.h"
@@ -47,6 +49,16 @@ int WINAPI WinMain(
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+    // Allocate a console for debug output (stderr logging)
+    AllocConsole();
+    FILE* dummy;
+    freopen_s(&dummy, "CONOUT$", "w", stderr);
+    std::cerr << "[OpenDisplay] Starting...\n";
+
+    // Set DPI awareness BEFORE any DXGI/window creation.
+    // Desktop Duplication requires the process to be DPI-aware.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     // ── Step 1: Initialize COM (apartment-threaded for WinUI/media) ──────────
     if (!InitializeCOM()) {

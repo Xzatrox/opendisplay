@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <d3d11.h>
+#include <mfapi.h>
 #include <mfidl.h>
 #include <mftransform.h>
 #include <wrl/client.h>
@@ -70,6 +71,7 @@ private:
 
     ComPtr<IMFTransform> m_transform;
     ComPtr<ID3D11Device> m_device;
+    ComPtr<IMFDXGIDeviceManager> m_deviceManager;  ///< Must persist for encoder lifetime
     std::atomic<bool> m_forceKeyframe{true};  ///< IDR on first frame
     std::atomic<int> m_pendingEncodes{0};
     Config m_config{};

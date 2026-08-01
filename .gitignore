@@ -38,3 +38,7 @@ fastlane/test_output/
 node_modules/
 dist-ssr/
 docs/
+
+# Windows build dependencies (NuGet packages, WDK)
+Windows/deps/
+Windows/build/

@@ -61,26 +61,34 @@ endif()
 
 set(_WDK_FOUND FALSE)
 
-# Check common WDK installation paths
-set(_WDK_SEARCH_PATHS
-    "$ENV{WDKContentRoot}"
-    "C:/Program Files (x86)/Windows Kits/10"
-    "C:/Program Files/Windows Kits/10"
-)
+# Check local deps/WDK (NuGet package) first
+set(_WDK_NUGET_DIR "${CMAKE_SOURCE_DIR}/deps/WDK/Microsoft.Windows.WDK.x64.10.0.26100.2454/c")
+if(EXISTS "${_WDK_NUGET_DIR}/Include/10.0.26100.0/um")
+    set(_WDK_FOUND TRUE)
+    set(WDK_ROOT "${_WDK_NUGET_DIR}")
+endif()
 
-foreach(_WDK_PATH ${_WDK_SEARCH_PATHS})
-    if(EXISTS "${_WDK_PATH}/Include/wdk")
-        set(_WDK_FOUND TRUE)
-        set(WDK_ROOT "${_WDK_PATH}")
-        break()
-    endif()
-    # Also check versioned include directories
-    if(EXISTS "${_WDK_PATH}/Include/10.0.22621.0/km")
-        set(_WDK_FOUND TRUE)
-        set(WDK_ROOT "${_WDK_PATH}")
-        break()
-    endif()
-endforeach()
+# Then check common WDK system installation paths
+if(NOT _WDK_FOUND)
+    set(_WDK_SEARCH_PATHS
+        "$ENV{WDKContentRoot}"
+        "C:/Program Files (x86)/Windows Kits/10"
+        "C:/Program Files/Windows Kits/10"
+    )
+
+    foreach(_WDK_PATH ${_WDK_SEARCH_PATHS})
+        if(EXISTS "${_WDK_PATH}/Include/wdk")
+            set(_WDK_FOUND TRUE)
+            set(WDK_ROOT "${_WDK_PATH}")
+            break()
+        endif()
+        if(EXISTS "${_WDK_PATH}/Include/10.0.22621.0/km")
+            set(_WDK_FOUND TRUE)
+            set(WDK_ROOT "${_WDK_PATH}")
+            break()
+        endif()
+    endforeach()
+endif()
 
 if(NOT _WDK_FOUND)
     message(WARNING
