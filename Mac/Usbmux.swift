@@ -138,7 +138,7 @@ enum Usbmux {
     static func open(queue: DispatchQueue) async throws -> NWConnection {
         let conn = NWConnection(to: .unix(path: socketPath), using: .tcp)
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            var resumed = false   // the handler fires on `queue` (serial)
+            nonisolated(unsafe) var resumed = false   // the handler fires on `queue` (serial)
             conn.stateUpdateHandler = { state in
                 guard !resumed else { return }
                 switch state {

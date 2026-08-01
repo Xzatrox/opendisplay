@@ -68,30 +68,25 @@ final class MacReceiver: ObservableObject {
     func start(port: UInt16 = 9000) {
         self.port = port
         setupInputHandler()
-        queue.async { self.startListener() }
+        startListener()
     }
 
     /// Stop listening, tear down connections.
     func stop() {
         inputHandler.detach()
-        queue.async {
-            self.connection?.cancel()
-            self.connection = nil
-            self.listener?.cancel()
-            self.listener = nil
-            // Tear down decoder session.
-            if let session = self.decoder {
-                VTDecompressionSessionInvalidate(session)
-                self.decoder = nil
-            }
-            self.formatDesc = nil
-            self.sps = nil
-            self.pps = nil
+        connection?.cancel()
+        connection = nil
+        listener?.cancel()
+        listener = nil
+        if let session = decoder {
+            VTDecompressionSessionInvalidate(session)
+            decoder = nil
         }
-        DispatchQueue.main.async {
-            self.connected = false
-            self.status = "Stopped"
-        }
+        formatDesc = nil
+        sps = nil
+        pps = nil
+        connected = false
+        status = "Stopped"
     }
 
     // MARK: - Listener setup
@@ -117,52 +112,59 @@ final class MacReceiver: ObservableObject {
         listener?.newConnectionHandler = { [weak self] conn in
             guard let self else { return }
             Log.info("MacReceiver: new connection from \(String(describing: conn.endpoint))")
-
-            // Replace any existing connection.
-            self.connection?.cancel()
-            self.connection = conn
-
-            conn.stateUpdateHandler = { [weak self] state in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                switch state {
-                case .ready:
-                    Log.info("MacReceiver: connection ready")
-                    DispatchQueue.main.async {
-                        self.connected = true
-                        self.status = "Connected"
+                // Replace any existing connection.
+                self.connection?.cancel()
+                self.connection = conn
+
+                conn.stateUpdateHandler = { [weak self] state in
+                    guard let self else { return }
+                    switch state {
+                    case .ready:
+                        Log.info("MacReceiver: connection ready")
+                        Task { @MainActor [weak self] in
+                            guard let self else { return }
+                            self.connected = true
+                            self.status = "Connected"
+                            self.sendHello(on: conn)
+                        }
+                    case .failed(let error):
+                        Log.info("MacReceiver: connection failed: \(error)")
+                        Task { @MainActor [weak self] in self?.handleConnectionLoss() }
+                    case .cancelled:
+                        Log.info("MacReceiver: connection cancelled")
+                        Task { @MainActor [weak self] in self?.handleConnectionLoss() }
+                    default:
+                        break
                     }
-                    self.sendHello(on: conn)
-                case .failed(let error):
-                    Log.info("MacReceiver: connection failed: \(error)")
-                    self.handleConnectionLoss()
-                case .cancelled:
-                    Log.info("MacReceiver: connection cancelled")
-                    self.handleConnectionLoss()
-                default:
-                    break
                 }
+                conn.start(queue: self.queue)
+                self.receive(on: conn)
             }
-            conn.start(queue: self.queue)
-            self.receive(on: conn)
         }
 
         listener?.stateUpdateHandler = { [weak self] state in
             guard let self else { return }
             switch state {
             case .ready:
-                Log.info("MacReceiver: listening on port \(self.port)")
-                DispatchQueue.main.async {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    Log.info("MacReceiver: listening on port \(self.port)")
                     self.status = "Waiting for sender…"
                 }
             case .failed(let error):
                 Log.info("MacReceiver: listener failed: \(error) — restarting in 1s")
-                DispatchQueue.main.async {
-                    self.status = "Listener failed — restarting…"
+                Task { @MainActor [weak self] in
+                    self?.status = "Listener failed — restarting…"
                 }
                 self.queue.asyncAfter(deadline: .now() + 1) {
-                    self.listener?.cancel()
-                    self.listener = nil
-                    self.startListener()
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.listener?.cancel()
+                        self.listener = nil
+                        self.startListener()
+                    }
                 }
             case .cancelled:
                 break
@@ -255,22 +257,23 @@ final class MacReceiver: ObservableObject {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
             [weak self] data, _, isComplete, error in
             guard let self else { return }
-
-            if let data, !data.isEmpty {
-                self.buffer.append(data)
-                self.drainFrames()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let data, !data.isEmpty {
+                    self.buffer.append(data)
+                    self.drainFrames()
+                }
+                if let error {
+                    Log.info("MacReceiver: receive error: \(error)")
+                    return
+                }
+                if isComplete {
+                    Log.info("MacReceiver: peer closed connection")
+                    self.handleConnectionLoss()
+                    return
+                }
+                self.receive(on: conn)
             }
-
-            if let error {
-                Log.info("MacReceiver: receive error: \(error)")
-                return
-            }
-            if isComplete {
-                Log.info("MacReceiver: peer closed connection")
-                self.handleConnectionLoss()
-                return
-            }
-            self.receive(on: conn)
         }
     }
 
@@ -529,15 +532,18 @@ final class MacReceiver: ObservableObject {
             session, sampleBuffer: sample, flags: [], infoFlagsOut: nil
         ) { [weak self] decodeStatus, _, imageBuffer, _, _ in
             guard let self else { return }
-            if decodeStatus == noErr, let imageBuffer {
-                self.decodeErrorCount = 0
-                self.renderFrame(imageBuffer, captureMs: captureMs)
-            } else {
-                self.decodeErrorCount += 1
-                if self.decodeErrorCount % 60 == 1 {
-                    Log.info("MacReceiver: decode output error: \(decodeStatus)")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if decodeStatus == noErr, let imageBuffer {
+                    self.decodeErrorCount = 0
+                    self.renderFrame(imageBuffer, captureMs: captureMs)
+                } else {
+                    self.decodeErrorCount += 1
+                    if self.decodeErrorCount % 60 == 1 {
+                        Log.info("MacReceiver: decode output error: \(decodeStatus)")
+                    }
+                    self.requestKeyframe()
                 }
-                self.requestKeyframe()
             }
         }
         if status != noErr {
