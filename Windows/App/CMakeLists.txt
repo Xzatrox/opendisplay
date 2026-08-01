@@ -23,6 +23,7 @@ set(APP_SOURCES
     src/ProtocolHandler.cpp
     src/WindowsInputInjector.cpp
     src/SessionController.cpp
+    src/AmfEncoder.cpp
     src/UI/MainWindow.cpp
     src/UI/ConnectionPicker.cpp
     src/dns_sd_stubs.cpp
@@ -36,6 +37,7 @@ target_include_directories(OpenDisplayApp
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/Shared
         ${CMAKE_SOURCE_DIR}/Tests/stubs
+        ${CMAKE_SOURCE_DIR}/deps/AMF/amf/public/include
 )
 
 target_compile_definitions(OpenDisplayApp

@@ -14,6 +14,7 @@
 
 #include "DesktopDuplicationCapture.h"
 #include "MFTEncoder.h"
+#include "AmfEncoder.h"
 #include "WireTransport.h"
 #include "WindowsInputInjector.h"
 
@@ -168,6 +169,7 @@ private:
     // Pipeline components (one per session)
     std::unique_ptr<DesktopDuplicationCapture> m_capture;
     std::unique_ptr<MFTEncoder> m_encoder;
+    std::unique_ptr<AmfEncoder> m_amfEncoder;
     std::unique_ptr<WireTransport> m_transport;
     std::unique_ptr<WindowsInputInjector> m_input;
     std::unique_ptr<ProtocolHandler> m_protocol;

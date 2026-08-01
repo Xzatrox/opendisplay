@@ -7,7 +7,9 @@
 #include <codecapi.h>
 #include <strmif.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d10.h>
+#include <dxgi.h>
 #include <iostream>
 
 #ifndef OutputDebugStringA
@@ -92,61 +94,79 @@ static HRESULT FindEncoder(bool hardwareOnly, ID3D11Device* device,
 
     if (SUCCEEDED(hr) && numActivate > 0 && device)
     {
-        // For hardware encoder, we need to pass the D3D device manager.
-        // Create a FRESH device using the default adapter (D3D_DRIVER_TYPE_HARDWARE)
-        // which is what the AMD AMF encoder expects.
+        // Get the DXGI adapter from the passed-in device to create encoder device
+        // on the SAME physical GPU. AMD AMF requires exact adapter match.
+        ComPtr<IDXGIDevice> dxgiDev;
+        device->QueryInterface(IID_PPV_ARGS(&dxgiDev));
+        ComPtr<IDXGIAdapter> adapter;
+        if (dxgiDev) dxgiDev->GetAdapter(&adapter);
+
         ComPtr<ID3D11Device> encDevice;
         D3D_FEATURE_LEVEL fl;
         D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+
+        // Create device on the SAME adapter with VIDEO_SUPPORT
         HRESULT devHr = D3D11CreateDevice(
-            nullptr,  // Default adapter — let the system pick the right GPU
-            D3D_DRIVER_TYPE_HARDWARE,
+            adapter.Get(),  // Same adapter as capture device
+            D3D_DRIVER_TYPE_UNKNOWN,  // Must be UNKNOWN when adapter is specified
             nullptr,
-            D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-            levels, 2,
-            D3D11_SDK_VERSION,
+            D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            levels, 2, D3D11_SDK_VERSION,
             encDevice.GetAddressOf(), &fl, nullptr);
 
         if (FAILED(devHr)) {
-            // Fall back to using the passed-in device
+            // Fallback: use the passed-in device directly
             encDevice = device;
+            std::cerr << "[FindEncoder] Could not create encoder device, using capture device\n";
         } else {
-            // Enable multithread protection
             ComPtr<ID3D10Multithread> mt;
             if (SUCCEEDED(encDevice->QueryInterface(IID_PPV_ARGS(&mt)))) {
                 mt->SetMultithreadProtected(TRUE);
             }
+            std::cerr << "[FindEncoder] Created encoder device on same adapter\n";
         }
 
         UINT resetToken = 0;
         ComPtr<IMFDXGIDeviceManager> deviceManager;
         MFCreateDXGIDeviceManager(&resetToken, deviceManager.GetAddressOf());
         if (deviceManager) {
-            deviceManager->ResetDevice(encDevice.Get(), resetToken);
+            HRESULT resetHr = deviceManager->ResetDevice(encDevice.Get(), resetToken);
+            std::cerr << "[FindEncoder] ResetDevice: 0x" << std::hex << resetHr << std::dec << "\n";
         }
 
         for (UINT32 i = 0; i < numActivate; ++i)
         {
-            // Activate the encoder
             hr = ppActivate[i]->ActivateObject(IID_PPV_ARGS(outTransform));
             if (SUCCEEDED(hr))
             {
                 isHardware = true;
                 std::cerr << "[FindEncoder] HW encoder activated (index " << i << ")\n";
 
-                // Set the device manager on the transform AFTER activation
                 if (deviceManager) {
                     HRESULT dmHr = (*outTransform)->ProcessMessage(
                         MFT_MESSAGE_SET_D3D_MANAGER,
                         reinterpret_cast<ULONG_PTR>(deviceManager.Get()));
                     std::cerr << "[FindEncoder] SET_D3D_MANAGER: 0x"
                               << std::hex << dmHr << std::dec << "\n";
-                    // If it fails, release and try next encoder
                     if (FAILED(dmHr)) {
-                        (*outTransform)->Release();
-                        *outTransform = nullptr;
-                        isHardware = false;
-                        continue;
+                        // Last resort: try with the original passed-in device
+                        UINT resetToken2 = 0;
+                        ComPtr<IMFDXGIDeviceManager> dm2;
+                        MFCreateDXGIDeviceManager(&resetToken2, dm2.GetAddressOf());
+                        if (dm2) {
+                            dm2->ResetDevice(device, resetToken2);
+                            dmHr = (*outTransform)->ProcessMessage(
+                                MFT_MESSAGE_SET_D3D_MANAGER,
+                                reinterpret_cast<ULONG_PTR>(dm2.Get()));
+                            std::cerr << "[FindEncoder] SET_D3D_MANAGER (original device): 0x"
+                                      << std::hex << dmHr << std::dec << "\n";
+                        }
+                        if (FAILED(dmHr)) {
+                            (*outTransform)->Release();
+                            *outTransform = nullptr;
+                            isHardware = false;
+                            continue;
+                        }
                     }
                 }
 
@@ -167,46 +187,7 @@ static HRESULT FindEncoder(bool hardwareOnly, ID3D11Device* device,
         }
     }
 
-    // Second pass: software fallback (if allowed)
-    if (hardwareOnly)
-    {
-        return MF_E_TOPO_CODEC_NOT_FOUND;
-    }
-
-    ppActivate = nullptr;
-    numActivate = 0;
-
-    UINT32 swFlags = MFT_ENUM_FLAG_SORTANDFILTER | MFT_ENUM_FLAG_SYNCMFT |
-                     MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_LOCALMFT;
-    hr = MFTEnumEx(
-        MFT_CATEGORY_VIDEO_ENCODER,
-        swFlags,
-        nullptr,
-        &outputType,
-        &ppActivate,
-        &numActivate);
-
-    if (SUCCEEDED(hr) && numActivate > 0)
-    {
-        for (UINT32 i = 0; i < numActivate; ++i)
-        {
-            hr = ppActivate[i]->ActivateObject(IID_PPV_ARGS(outTransform));
-            if (SUCCEEDED(hr))
-            {
-                for (UINT32 j = 0; j < numActivate; j++) ppActivate[j]->Release();
-                CoTaskMemFree(ppActivate);
-                std::cerr << "[FindEncoder] SW encoder activated (index " << i << ")\n";
-                return S_OK;
-            }
-        }
-        for (UINT32 i = 0; i < numActivate; i++) ppActivate[i]->Release();
-        CoTaskMemFree(ppActivate);
-    }
-    else if (ppActivate)
-    {
-        CoTaskMemFree(ppActivate);
-    }
-
+    // No software fallback — GPU-only
     return MF_E_TOPO_CODEC_NOT_FOUND;
 }
 
@@ -538,120 +519,164 @@ HRESULT MFTEncoder::SubmitFrame(ID3D11Texture2D* texture, int64_t captureTimesta
     }
     else
     {
-        // Software path: copy GPU texture to CPU memory, create memory buffer
-        // 1. Get texture description
+        // GPU path: use D3D11 Video Processor to convert BGRA→NV12 on GPU
         D3D11_TEXTURE2D_DESC texDesc = {};
         texture->GetDesc(&texDesc);
-        std::cerr << "[Enc] SW path: " << texDesc.Width << "x" << texDesc.Height
-                  << " fmt=" << texDesc.Format << "\n";
 
-        // 2. Create staging texture for CPU readback
         ComPtr<ID3D11Device> texDevice;
         texture->GetDevice(texDevice.GetAddressOf());
         ComPtr<ID3D11DeviceContext> ctx;
         texDevice->GetImmediateContext(ctx.GetAddressOf());
 
-        D3D11_TEXTURE2D_DESC stagingDesc = texDesc;
-        stagingDesc.Usage = D3D11_USAGE_STAGING;
-        stagingDesc.BindFlags = 0;
-        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        stagingDesc.MiscFlags = 0;
+        // Create NV12 target texture for the video processor output
+        D3D11_TEXTURE2D_DESC nv12Desc = {};
+        nv12Desc.Width = m_config.width;
+        nv12Desc.Height = m_config.height;
+        nv12Desc.MipLevels = 1;
+        nv12Desc.ArraySize = 1;
+        nv12Desc.Format = DXGI_FORMAT_NV12;
+        nv12Desc.SampleDesc.Count = 1;
+        nv12Desc.Usage = D3D11_USAGE_DEFAULT;
+        nv12Desc.BindFlags = D3D11_BIND_RENDER_TARGET;
 
-        ComPtr<ID3D11Texture2D> staging;
-        hr = texDevice->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf());
+        ComPtr<ID3D11Texture2D> nv12Texture;
+        hr = texDevice->CreateTexture2D(&nv12Desc, nullptr, nv12Texture.GetAddressOf());
         if (FAILED(hr))
         {
-            std::cerr << "[Enc] CreateStagingTexture failed: 0x" << std::hex << hr << std::dec << "\n";
-            m_hasError = true;
-            return hr;
+            // Fallback: GPU video processor not available, use staging copy
+            goto cpu_fallback;
         }
 
-        // 3. Copy GPU texture to staging
-        std::cerr << "[Enc] CopyResource...\n";
-        ctx->CopyResource(staging.Get(), texture);
-        std::cerr << "[Enc] Map...\n";
-
-        // 4. Map staging texture to get CPU pointer
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr))
+        // Use D3D11 Video Processor for BGRA→NV12 conversion
         {
-            std::cerr << "[Enc] Map failed: 0x" << std::hex << hr << std::dec << "\n";
-            m_hasError = true;
-            return hr;
+            ComPtr<ID3D11VideoDevice> videoDevice;
+            hr = texDevice->QueryInterface(IID_PPV_ARGS(&videoDevice));
+            if (FAILED(hr)) goto cpu_fallback;
+
+            ComPtr<ID3D11VideoContext> videoCtx;
+            hr = ctx->QueryInterface(IID_PPV_ARGS(&videoCtx));
+            if (FAILED(hr)) goto cpu_fallback;
+
+            // Create video processor enumerator
+            D3D11_VIDEO_PROCESSOR_CONTENT_DESC vpDesc = {};
+            vpDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+            vpDesc.InputWidth = texDesc.Width;
+            vpDesc.InputHeight = texDesc.Height;
+            vpDesc.OutputWidth = m_config.width;
+            vpDesc.OutputHeight = m_config.height;
+            vpDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+            ComPtr<ID3D11VideoProcessorEnumerator> vpEnum;
+            hr = videoDevice->CreateVideoProcessorEnumerator(&vpDesc, vpEnum.GetAddressOf());
+            if (FAILED(hr)) goto cpu_fallback;
+
+            ComPtr<ID3D11VideoProcessor> vp;
+            hr = videoDevice->CreateVideoProcessor(vpEnum.Get(), 0, vp.GetAddressOf());
+            if (FAILED(hr)) goto cpu_fallback;
+
+            // Create input view (BGRA source texture)
+            D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inputViewDesc = {};
+            inputViewDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+            inputViewDesc.Texture2D.MipSlice = 0;
+            ComPtr<ID3D11VideoProcessorInputView> inputView;
+            hr = videoDevice->CreateVideoProcessorInputView(texture, vpEnum.Get(),
+                &inputViewDesc, inputView.GetAddressOf());
+            if (FAILED(hr)) goto cpu_fallback;
+
+            // Create output view (NV12 target texture)
+            D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outputViewDesc = {};
+            outputViewDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+            ComPtr<ID3D11VideoProcessorOutputView> outputView;
+            hr = videoDevice->CreateVideoProcessorOutputView(nv12Texture.Get(), vpEnum.Get(),
+                &outputViewDesc, outputView.GetAddressOf());
+            if (FAILED(hr)) goto cpu_fallback;
+
+            // Run the video processor (GPU BGRA→NV12 conversion)
+            D3D11_VIDEO_PROCESSOR_STREAM stream = {};
+            stream.Enable = TRUE;
+            stream.pInputSurface = inputView.Get();
+            hr = videoCtx->VideoProcessorBlt(vp.Get(), outputView.Get(), 0, 1, &stream);
+            if (FAILED(hr)) goto cpu_fallback;
         }
-        std::cerr << "[Enc] Mapped OK, pitch=" << mapped.RowPitch << "\n";
 
-        // 5. Create MF memory buffer with NV12 data converted from BGRA
-        // NV12 = Y plane (full res) + interleaved UV plane (half res)
-        // Use ENCODER height (m_config.height) not texture height to match encoder config
-        UINT32 encW = m_config.width;
-        UINT32 encH = m_config.height;
-        UINT32 srcW = texDesc.Width;
-        UINT32 srcH = texDesc.Height;
-        // Clamp to encoder dimensions
-        UINT32 copyW = (srcW < encW) ? srcW : encW;
-        UINT32 copyH = (srcH < encH) ? srcH : encH;
+        // Create DXGI surface buffer from the NV12 texture (GPU zero-copy to encoder)
+        hr = MFCreateDXGISurfaceBuffer(
+            __uuidof(ID3D11Texture2D),
+            nv12Texture.Get(),
+            0, FALSE,
+            mediaBuffer.GetAddressOf());
 
-        UINT32 nv12Size = encW * encH * 3 / 2;
-        hr = MFCreateMemoryBuffer(nv12Size, mediaBuffer.GetAddressOf());
         if (SUCCEEDED(hr))
         {
-            BYTE* bufferPtr = nullptr;
-            DWORD maxLen = 0;
-            hr = mediaBuffer->Lock(&bufferPtr, &maxLen, nullptr);
+            // Success — GPU path worked
+            goto buffer_ready;
+        }
+
+cpu_fallback:
+        // CPU fallback: copy to staging and convert manually
+        {
+            D3D11_TEXTURE2D_DESC stagingDesc = texDesc;
+            stagingDesc.Usage = D3D11_USAGE_STAGING;
+            stagingDesc.BindFlags = 0;
+            stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            stagingDesc.MiscFlags = 0;
+
+            ComPtr<ID3D11Texture2D> staging;
+            hr = texDevice->CreateTexture2D(&stagingDesc, nullptr, staging.GetAddressOf());
+            if (FAILED(hr)) { m_hasError = true; return hr; }
+
+            ctx->CopyResource(staging.Get(), texture);
+
+            D3D11_MAPPED_SUBRESOURCE mapped = {};
+            hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+            if (FAILED(hr)) { m_hasError = true; return hr; }
+
+            UINT32 encW = m_config.width;
+            UINT32 encH = m_config.height;
+            UINT32 copyW = (texDesc.Width < encW) ? texDesc.Width : encW;
+            UINT32 copyH = (texDesc.Height < encH) ? texDesc.Height : encH;
+            UINT32 nv12Size = encW * encH * 3 / 2;
+
+            hr = MFCreateMemoryBuffer(nv12Size, mediaBuffer.GetAddressOf());
             if (SUCCEEDED(hr))
             {
-                // Zero the buffer first (handles padding if texture is smaller than encoder)
-                memset(bufferPtr, 0, nv12Size);
-                memset(bufferPtr + encW * encH, 128, encW * encH / 2); // UV = 128 (neutral)
-
-                // Convert BGRA → NV12 (BT.601)
-                BYTE* yPlane = bufferPtr;
-                BYTE* uvPlane = bufferPtr + encW * encH;
-                const BYTE* srcData = static_cast<const BYTE*>(mapped.pData);
-
-                for (UINT32 y = 0; y < copyH; ++y)
+                BYTE* bufferPtr = nullptr;
+                hr = mediaBuffer->Lock(&bufferPtr, nullptr, nullptr);
+                if (SUCCEEDED(hr))
                 {
-                    const BYTE* row = srcData + y * mapped.RowPitch;
-                    for (UINT32 x = 0; x < copyW; ++x)
+                    memset(bufferPtr, 0, encW * encH);
+                    memset(bufferPtr + encW * encH, 128, encW * encH / 2);
+                    BYTE* yPlane = bufferPtr;
+                    BYTE* uvPlane = bufferPtr + encW * encH;
+                    const BYTE* srcData = static_cast<const BYTE*>(mapped.pData);
+                    for (UINT32 y = 0; y < copyH; ++y)
                     {
-                        BYTE b = row[x * 4 + 0];
-                        BYTE g = row[x * 4 + 1];
-                        BYTE r = row[x * 4 + 2];
-
-                        int yVal = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                        yPlane[y * encW + x] = static_cast<BYTE>(
-                            yVal < 0 ? 0 : (yVal > 255 ? 255 : yVal));
-
-                        if ((y % 2 == 0) && (x % 2 == 0))
+                        const BYTE* row = srcData + y * mapped.RowPitch;
+                        for (UINT32 x = 0; x < copyW; ++x)
                         {
-                            int uVal = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                            int vVal = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
-                            UINT32 uvIdx = (y / 2) * encW + x;
-                            uvPlane[uvIdx] = static_cast<BYTE>(
-                                uVal < 0 ? 0 : (uVal > 255 ? 255 : uVal));
-                            uvPlane[uvIdx + 1] = static_cast<BYTE>(
-                                vVal < 0 ? 0 : (vVal > 255 ? 255 : vVal));
+                            // BGRA format: B=0, G=1, R=2, A=3
+                            BYTE b = row[x*4], g = row[x*4+1], r = row[x*4+2];
+                            int yV = ((66*r + 129*g + 25*b + 128) >> 8) + 16;
+                            yPlane[y*encW + x] = (BYTE)(yV < 0 ? 0 : (yV > 255 ? 255 : yV));
+                            if ((y%2==0) && (x%2==0)) {
+                                int uV = ((-38*r - 74*g + 112*b + 128) >> 8) + 128;
+                                int vV = ((112*r - 94*g - 18*b + 128) >> 8) + 128;
+                                UINT32 ui = (y/2)*encW + x;
+                                uvPlane[ui] = (BYTE)(uV < 0 ? 0 : (uV > 255 ? 255 : uV));
+                                uvPlane[ui+1] = (BYTE)(vV < 0 ? 0 : (vV > 255 ? 255 : vV));
+                            }
                         }
                     }
+                    mediaBuffer->Unlock();
+                    mediaBuffer->SetCurrentLength(nv12Size);
                 }
-                mediaBuffer->Unlock();
-                mediaBuffer->SetCurrentLength(nv12Size);
-                std::cerr << "[Enc] NV12 conversion done (" << copyW << "x" << copyH
-                          << " -> enc " << encW << "x" << encH << ")\n";
             }
+            ctx->Unmap(staging.Get(), 0);
+            if (FAILED(hr)) { m_hasError = true; return hr; }
         }
 
-        ctx->Unmap(staging.Get(), 0);
-        std::cerr << "[Enc] Buffer ready\n";
-
-        if (FAILED(hr))
-        {
-            std::cerr << "[Enc] Buffer creation failed: 0x" << std::hex << hr << std::dec << "\n";
-            m_hasError = true;
-            return hr;
-        }
+buffer_ready:
+        ;
     }
 
     if (FAILED(hr))
@@ -684,18 +709,12 @@ HRESULT MFTEncoder::SubmitFrame(ID3D11Texture2D* texture, int64_t captureTimesta
     LONGLONG duration = 10000000LL / static_cast<LONGLONG>(m_config.fps);
     sample->SetSampleDuration(duration);
 
-    std::cerr << "[Enc] ProcessInput...\n";
-    std::cerr.flush();
     hr = m_transform->ProcessInput(0, sample.Get(), 0);
     if (FAILED(hr))
     {
-        std::cerr << "[Enc] ProcessInput FAILED: 0x" << std::hex << hr << std::dec << "\n";
-        std::cerr.flush();
         m_hasError = true;
         return hr;
     }
-    std::cerr << "[Enc] ProcessInput OK\n";
-    std::cerr.flush();
 
     // Track pending encode
     m_pendingEncodes.fetch_add(1);
@@ -792,11 +811,7 @@ HRESULT MFTEncoder::GetOutput(std::vector<uint8_t>& annexBData, bool& isKeyframe
 
     // Try to retrieve output from the encoder
     DWORD status = 0;
-    std::cerr << "[Enc] GetOutput: calling ProcessOutput...\n";
-    std::cerr.flush();
     hr = m_transform->ProcessOutput(0, 1, &outputBuffer, &status);
-    std::cerr << "[Enc] GetOutput: ProcessOutput returned 0x" << std::hex << hr << std::dec << "\n";
-    std::cerr.flush();
 
     // Release any events returned
     if (outputBuffer.pEvents)
@@ -815,8 +830,7 @@ HRESULT MFTEncoder::GetOutput(std::vector<uint8_t>& annexBData, bool& isKeyframe
 
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE)
     {
-        std::cerr << "[Enc] GetOutput: STREAM_CHANGE — renegotiating\n";
-        // Output type changed — re-negotiate and try again
+        // Output type changed — re-negotiate
         ComPtr<IMFMediaType> newOutputType;
         HRESULT hrType = m_transform->GetOutputAvailableType(0, 0, newOutputType.GetAddressOf());
         if (SUCCEEDED(hrType))
@@ -829,12 +843,9 @@ HRESULT MFTEncoder::GetOutput(std::vector<uint8_t>& annexBData, bool& isKeyframe
 
     if (FAILED(hr))
     {
-        std::cerr << "[Enc] GetOutput: ProcessOutput FAILED: 0x" << std::hex << hr << std::dec << "\n";
         m_hasError = true;
         return hr;
     }
-
-    std::cerr << "[Enc] GetOutput: ProcessOutput SUCCESS\n";
 
     // Get the sample from the output buffer
     IMFSample* resultSample = outputBuffer.pSample;

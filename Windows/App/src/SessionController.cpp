@@ -592,10 +592,14 @@ void SessionController::EndSession()
         m_transport.reset();
     }
 
-    // 6. Release MFT encoder
+    // 6. Release encoder
     if (m_encoder) {
         m_encoder->Shutdown();
         m_encoder.reset();
+    }
+    if (m_amfEncoder) {
+        m_amfEncoder->Shutdown();
+        m_amfEncoder.reset();
     }
 
     // 7. Stop desktop duplication capture
@@ -622,6 +626,9 @@ void SessionController::EndSession()
     // Reset display dimensions
     m_displayWidth = 0;
     m_displayHeight = 0;
+
+    // Reset state to Idle so a new session can be started
+    SetState(State::Idle, "");
 }
 
 // ─── SessionController: Pipeline Loop ────────────────────────────────────────
@@ -630,85 +637,44 @@ void SessionController::PipelineLoop()
 {
     std::cerr << "[Pipeline] Starting. capture="
               << (m_capture ? "yes" : "NO")
-              << " encoder=" << (m_encoder ? "yes" : "NO")
+              << " amfEncoder=" << (m_amfEncoder ? "yes" : "NO")
               << " transport=" << (m_transport ? "yes" : "NO") << "\n";
 
-    if (!m_capture || !m_encoder || !m_transport) {
-        std::cerr << "[Pipeline] Missing component — exiting pipeline loop.\n";
+    if (!m_capture || !m_amfEncoder || !m_transport) {
+        std::cerr << "[Pipeline] Missing component. Exiting.\n";
         return;
     }
 
-    int frameCount = 0;
-    int captureErrors = 0;
-    int encodeErrors = 0;
-    int sentFrames = 0;
-    int loopCount = 0;
+    int frameCount = 0, sentFrames = 0, loopCount = 0;
 
     while (m_pipelineRunning.load()) {
         loopCount++;
-        if (loopCount <= 20 || loopCount % 100 == 0) {
-            std::cerr << "[Loop " << loopCount << "] top\n";
-            std::cerr.flush();
+
+        // Get encoded output from AMF
+        std::vector<uint8_t> annexBData;
+        bool isKeyframe = false;
+        HRESULT outHr = m_amfEncoder->GetOutput(annexBData, isKeyframe);
+        if (outHr == S_OK && !annexBData.empty()) {
+            m_transport->SendVideoFrame(annexBData, 0, NowMs());
+            sentFrames++;
         }
 
-        // Step A: Try to get output from encoder
-        if (m_encoder) {
-            if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] A: GetOutput\n"; std::cerr.flush(); }
-            std::vector<uint8_t> annexBData;
-            bool isKeyframe = false;
-            HRESULT outHr = m_encoder->GetOutput(annexBData, isKeyframe);
-            if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] A: GetOutput=0x" << std::hex << outHr << std::dec << " sz=" << annexBData.size() << "\n"; std::cerr.flush(); }
-            if (SUCCEEDED(outHr) && !annexBData.empty()) {
-                int64_t sendMs = NowMs();
-                HRESULT sendHr = m_transport->SendVideoFrame(annexBData, 0, sendMs);
-                sentFrames++;
-                std::cerr << "[Loop " << loopCount << "] SENT #" << sentFrames << " sz=" << annexBData.size() << " kf=" << isKeyframe << " sendHr=0x" << std::hex << sendHr << std::dec << "\n";
-                std::cerr.flush();
-            }
-        }
-
-        // Step B: Acquire frame
-        if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] B: AcquireFrame\n"; std::cerr.flush(); }
+        // Acquire frame from Desktop Duplication
         ID3D11Texture2D* texture = nullptr;
         DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
         HRESULT hr = m_capture->AcquireFrame(kCaptureTimeoutMs, &texture, &frameInfo);
-        if (loopCount <= 20) { std::cerr << "[Loop " << loopCount << "] B: AcquireFrame=0x" << std::hex << hr << std::dec << "\n"; std::cerr.flush(); }
-
-        if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-            continue;
-        }
-
-        if (FAILED(hr)) {
-            captureErrors++;
-            std::cerr << "[Loop " << loopCount << "] B: capture FAIL 0x" << std::hex << hr << std::dec << "\n"; std::cerr.flush();
-            continue;
-        }
+        if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
+        if (FAILED(hr)) continue;
 
         frameCount++;
-        std::cerr << "[Loop " << loopCount << "] C: frame #" << frameCount << "\n"; std::cerr.flush();
 
-        // Step C: Submit to encoder
-        int64_t captureMs = NowMs();
-        std::cerr << "[Loop " << loopCount << "] C: SubmitFrame\n"; std::cerr.flush();
-        hr = m_encoder->SubmitFrame(texture, captureMs);
+        // Submit BGRA texture directly to AMF (GPU zero-copy)
+        m_amfEncoder->SubmitFrame(texture, NowMs());
         m_capture->ReleaseFrame();
-        std::cerr << "[Loop " << loopCount << "] C: SubmitFrame=0x" << std::hex << hr << std::dec << "\n"; std::cerr.flush();
-
-        if (hr == MF_E_NOTACCEPTING) {
-            std::cerr << "[Loop " << loopCount << "] C: encoder busy, dropped\n"; std::cerr.flush();
-            continue;
-        }
-
-        if (FAILED(hr)) {
-            encodeErrors++;
-            std::cerr << "[Loop " << loopCount << "] C: encode FAIL\n"; std::cerr.flush();
-            continue;
-        }
     }
-    std::cerr << "[Pipeline] Exited. loops=" << loopCount << " frames=" << frameCount
-              << " sent=" << sentFrames << " captErr=" << captureErrors
-              << " encErr=" << encodeErrors << "\n";
-    std::cerr.flush();
+
+    std::cerr << "[Pipeline] Exited. frames=" << frameCount
+              << " sent=" << sentFrames << "\n";
 }
 
 // ─── SessionController: Hello / Sleep / Close Handlers ───────────────────────
@@ -804,48 +770,27 @@ void SessionController::OnHelloReceived(const HelloInfo& info)
         }
     }
 
-    // Initialize encoder with the D3D device from VDD (or nullptr as fallback)
+    // Initialize AMF hardware encoder (AMD GPU)
     ID3D11Device* encDevice = haveVDD ? vddInfo.device.Get() : nullptr;
-    m_encoder = std::make_unique<MFTEncoder>();
-    MFTEncoder::Config encoderConfig;
-    // H.264 encoders require specific resolution alignment.
-    // AMD AMF often requires width divisible by 16, and has max limits.
-    // Use 1920x1080 as a safe fallback that all encoders support,
-    // then try the actual resolution.
     uint32_t encWidth = haveVDD ? vddInfo.width : width;
     uint32_t encHeight = haveVDD ? vddInfo.height : height;
-    encWidth = (encWidth / 16) * 16;
-    encHeight = (encHeight / 16) * 16;
-    if (encWidth == 0) encWidth = 16;
-    if (encHeight == 0) encHeight = 16;
+    // AMF accepts BGRA input directly — no need for resolution alignment tricks
 
     std::cerr << "[SessionController] Encoder resolution: "
               << encWidth << "x" << encHeight << "\n";
 
-    encoderConfig.width = encWidth;
-    encoderConfig.height = encHeight;
-    encoderConfig.fps = 60;
-    encoderConfig.bitrate = BitrateFromQuality(m_quality);
-    encoderConfig.hardwareOnly = false;
+    m_amfEncoder = std::make_unique<AmfEncoder>();
+    AmfEncoder::Config amfConfig;
+    amfConfig.width = encWidth;
+    amfConfig.height = encHeight;
+    amfConfig.fps = 60;
+    amfConfig.bitrate = BitrateFromQuality(m_quality);
 
-    HRESULT encHr = m_encoder->Initialize(encoderConfig, encDevice);
-
-    // If the native resolution failed, try 1920x1080 as safe fallback
+    HRESULT encHr = m_amfEncoder->Initialize(amfConfig, encDevice);
     if (FAILED(encHr)) {
-        std::cerr << "[SessionController] Native res failed, trying 1920x1080...\n";
-        encoderConfig.width = 1920;
-        encoderConfig.height = 1080;
-        m_encoder = std::make_unique<MFTEncoder>();
-        encHr = m_encoder->Initialize(encoderConfig, encDevice);
-    }
-
-    if (FAILED(encHr)) {
-        std::cerr << "[SessionController] Encoder init failed: 0x"
+        std::cerr << "[SessionController] AMF encoder init failed: 0x"
                   << std::hex << encHr << std::dec << "\n";
-        m_encoder.reset();
-    } else {
-        std::cerr << "[SessionController] Encoder initialized: "
-                  << encoderConfig.width << "x" << encoderConfig.height << "\n";
+        m_amfEncoder.reset();
     }
 
     // Start streaming
