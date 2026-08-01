@@ -1,6 +1,7 @@
-// AMF-based H.264 hardware encoder using AMD Advanced Media Framework.
+// AMF-based H.264/H.265 hardware encoder using AMD Advanced Media Framework.
 // The AMF runtime (amfrt64.dll) is installed with AMD GPU drivers.
 // This implementation loads AMF dynamically at runtime.
+// Default codec is HEVC (H.265) for better compression; falls back to AVC (H.264).
 
 #include "AmfEncoder.h"
 
@@ -11,6 +12,7 @@
 
 // AMF SDK headers
 #include "components/VideoEncoderVCE.h"
+#include "components/VideoEncoderHEVC.h"
 #include "core/Factory.h"
 #include "core/Context.h"
 #include "core/Trace.h"
@@ -29,6 +31,7 @@ struct AmfEncoder::Impl {
     ComPtr<ID3D11Device> device;
     int64_t frameIndex = 0;
     bool firstFrame = true;
+    bool useHevc = false; // true = H.265, false = H.264
 };
 
 AmfEncoder::AmfEncoder() : m_impl(new Impl()) {}
@@ -86,37 +89,77 @@ HRESULT AmfEncoder::Initialize(const Config& config, ID3D11Device* device)
     }
     std::cerr << "[AmfEncoder] AMF context initialized with D3D11 device\n";
 
-    // Create H.264 encoder component
-    res = m_impl->factory->CreateComponent(m_impl->context, AMFVideoEncoderVCE_AVC,
+    // Try HEVC (H.265) first — better compression at same bitrate.
+    // Fall back to AVC (H.264) if HEVC is not supported.
+    res = m_impl->factory->CreateComponent(m_impl->context, AMFVideoEncoder_HEVC,
                                             &m_impl->encoder);
-    if (res != AMF_OK) {
-        std::cerr << "[AmfEncoder] CreateComponent(AVC) failed: " << res << "\n";
-        return E_FAIL;
+    if (res == AMF_OK) {
+        m_impl->useHevc = true;
+        std::cerr << "[AmfEncoder] Using HEVC (H.265) hardware encoder\n";
+
+        // Configure HEVC encoder for low-latency streaming
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_USAGE,
+                                      AMF_VIDEO_ENCODER_HEVC_USAGE_LOW_LATENCY);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE,
+                                      AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD,
+                                      AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE,
+                                      (amf_int64)config.bitrate);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_FRAMERATE,
+                                      AMFConstructRate(config.fps, 1));
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET,
+                                      AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE, true);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, (amf_int64)3600);
+
+        res = m_impl->encoder->Init(amf::AMF_SURFACE_BGRA, config.width, config.height);
+        if (res != AMF_OK) {
+            std::cerr << "[AmfEncoder] HEVC Init failed: " << res << ", falling back to AVC\n";
+            m_impl->encoder->Terminate();
+            m_impl->encoder = nullptr;
+            m_impl->useHevc = false;
+        }
     }
 
-    // Configure encoder for low-latency streaming
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY);
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_HIGH);
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
-                                  AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, (amf_int64)config.bitrate);
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE, AMFConstructRate(config.fps, 1));
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, (amf_int64)0); // No B-frames
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
-                                  AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
-    m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, (amf_int64)3600);
+    // Fallback to AVC (H.264)
+    if (!m_impl->encoder) {
+        res = m_impl->factory->CreateComponent(m_impl->context, AMFVideoEncoderVCE_AVC,
+                                                &m_impl->encoder);
+        if (res != AMF_OK) {
+            std::cerr << "[AmfEncoder] CreateComponent(AVC) failed: " << res << "\n";
+            return E_FAIL;
+        }
+        m_impl->useHevc = false;
+        std::cerr << "[AmfEncoder] Using AVC (H.264) hardware encoder\n";
 
-    // Initialize the encoder with frame dimensions
-    res = m_impl->encoder->Init(amf::AMF_SURFACE_BGRA, config.width, config.height);
-    if (res != AMF_OK) {
-        std::cerr << "[AmfEncoder] Encoder Init(" << config.width << "x"
-                  << config.height << ") failed: " << res << "\n";
-        return E_FAIL;
+        // Configure AVC encoder for low-latency streaming
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_USAGE,
+                                      AMF_VIDEO_ENCODER_USAGE_LOW_LATENCY);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE,
+                                      AMF_VIDEO_ENCODER_PROFILE_HIGH);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD,
+                                      AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE,
+                                      (amf_int64)config.bitrate);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_FRAMERATE,
+                                      AMFConstructRate(config.fps, 1));
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_B_PIC_PATTERN, (amf_int64)0);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_QUALITY_PRESET,
+                                      AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_LOWLATENCY_MODE, true);
+        m_impl->encoder->SetProperty(AMF_VIDEO_ENCODER_IDR_PERIOD, (amf_int64)3600);
+
+        res = m_impl->encoder->Init(amf::AMF_SURFACE_BGRA, config.width, config.height);
+        if (res != AMF_OK) {
+            std::cerr << "[AmfEncoder] AVC Init failed: " << res << "\n";
+            return E_FAIL;
+        }
     }
 
     std::cerr << "[AmfEncoder] Initialized: " << config.width << "x" << config.height
-              << " @ " << config.bitrate / 1000000 << " Mbps (HW)\n";
+              << " @ " << config.bitrate / 1000000 << " Mbps ("
+              << (m_impl->useHevc ? "HEVC" : "AVC") << " HW)\n";
     m_initialized = true;
     m_forceKeyframe.store(true);
     return S_OK;
@@ -141,10 +184,16 @@ HRESULT AmfEncoder::SubmitFrame(ID3D11Texture2D* texture, int64_t captureTimesta
 
     // Force IDR if requested
     if (m_forceKeyframe.exchange(false)) {
-        surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
-                             AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR);
-        surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
-        surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
+        if (m_impl->useHevc) {
+            surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_FORCE_PICTURE_TYPE,
+                                 AMF_VIDEO_ENCODER_HEVC_PICTURE_TYPE_IDR);
+            surface->SetProperty(AMF_VIDEO_ENCODER_HEVC_INSERT_HEADER, true);
+        } else {
+            surface->SetProperty(AMF_VIDEO_ENCODER_FORCE_PICTURE_TYPE,
+                                 AMF_VIDEO_ENCODER_PICTURE_TYPE_IDR);
+            surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_SPS, true);
+            surface->SetProperty(AMF_VIDEO_ENCODER_INSERT_PPS, true);
+        }
     }
 
     // Submit to encoder (non-blocking)
@@ -195,8 +244,14 @@ HRESULT AmfEncoder::GetOutput(std::vector<uint8_t>& annexBData, bool& isKeyframe
 
     // Check if it's a keyframe
     amf_int64 outputType = 0;
-    if (data->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &outputType) == AMF_OK) {
-        isKeyframe = (outputType == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR);
+    if (m_impl->useHevc) {
+        if (data->GetProperty(AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE, &outputType) == AMF_OK) {
+            isKeyframe = (outputType == AMF_VIDEO_ENCODER_HEVC_OUTPUT_DATA_TYPE_IDR);
+        }
+    } else {
+        if (data->GetProperty(AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE, &outputType) == AMF_OK) {
+            isKeyframe = (outputType == AMF_VIDEO_ENCODER_OUTPUT_DATA_TYPE_IDR);
+        }
     }
 
     return S_OK;

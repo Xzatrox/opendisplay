@@ -44,6 +44,8 @@ pipeline, USB transport, input injection) are already working.
 - 🖥️ **True display extension** — macOS treats the device as a real second
   monitor (drag windows to it, arrange it in System Settings), not a mirror.
   Mirroring is also available as a mode.
+- 🪟 **Windows 11 sender** — use your Mac as a second display for a Windows
+  PC over the network (AMD GPU hardware encoding via AMF).
 - 🔌 **USB-wired for lowest latency** — streams over the Lightning/USB-C
   cable via macOS's built-in `usbmuxd`; plug in and go, no network, no
   WiFi jitter, no helper tools.
@@ -56,9 +58,9 @@ pipeline, USB transport, input injection) are already working.
   like a trackpad. (Apple Pencil support is on the roadmap.)
 - 🔄 **Portrait or landscape** — rotate the device and the virtual display
   rebuilds itself as a vertical monitor at native resolution.
-- ⚡ **Low-latency pipeline** — hardware H.264 encode (VideoToolbox,
-  real-time mode, no B-frames), TCP_NODELAY, frame-drop backpressure with
-  keyframe recovery, decode-and-render via `AVSampleBufferDisplayLayer`.
+- ⚡ **Low-latency pipeline** — hardware H.264 encode (VideoToolbox on Mac,
+  AMF on AMD Windows, real-time mode, no B-frames), TCP_NODELAY, frame-drop
+  backpressure with keyframe recovery.
 - 🔒 **Self-hosted & private** — your screen never touches anyone's server.
   Two small apps, one TCP connection, that's it.
 
@@ -150,6 +152,76 @@ Open the iPhone app, then pick **"iPhone (WiFi)"** from the Connection menu
 in the Mac app. Discovery is automatic via Bonjour. USB has lower latency;
 WiFi has no cable.
 
+---
+
+## Windows Sender (use a Mac as second display for Windows)
+
+The Windows sender captures a virtual display, encodes via AMD AMF hardware
+encoder, and streams to a Mac running OpenDisplay in receiver mode.
+
+### Windows prerequisites
+
+| Dependency | Purpose | Install |
+|---|---|---|
+| **Visual Studio 2022** Build Tools | C++ compiler (MSVC v143+) | [visualstudio.microsoft.com](https://visualstudio.microsoft.com/downloads/) — select "Desktop development with C++" |
+| **Windows SDK** 10.0.22621.0+ | System headers/libs | Included with VS Build Tools |
+| **CMake** 3.21+ | Build system | Included with VS Build Tools |
+| **Bonjour Print Services** | mDNS/DNS-SD for device discovery | [support.apple.com/kb/DL999](https://support.apple.com/kb/DL999) |
+| **Apple Devices** (Microsoft Store) | USB communication with iOS (AMDS) | Microsoft Store → "Apple Devices" |
+| **Virtual Display Driver** | Creates a virtual monitor on Windows | [github.com/VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases) |
+| **AMD GPU** (RX 5000+) | Hardware H.264 encoding via AMF | AMD driver automatically includes `amfrt64.dll` |
+
+### Windows build
+
+```powershell
+cd Windows
+
+# Fetch AMF SDK headers (one-time)
+git clone --depth 1 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git deps/AMF
+cd deps/AMF && git sparse-checkout set amf/public/include && cd ../..
+
+# Configure and build
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --target OpenDisplayApp --config Release
+```
+
+The built executable is at `Windows/build/App/Release/OpenDisplay.exe`.
+
+### Windows setup
+
+1. **Install Virtual Display Driver** — download from the [releases page](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases), run VDDControl.exe as Administrator to install
+2. **Configure VDD resolution** — edit `C:\VirtualDisplayDriver\vdd_settings.xml` to match your Mac's native resolution (e.g., 3024×1964 for MacBook Pro 14")
+3. **Install Bonjour** — download and install [Bonjour Print Services for Windows](https://support.apple.com/kb/DL999) to enable network discovery
+4. **Extend desktop** — in Windows Settings → Display, set the virtual display to "Extend"
+
+### Windows usage
+
+1. On the Mac, run **OpenDisplay** (it acts as a receiver, listening on port 9000)
+2. On Windows, run `OpenDisplay.exe`
+3. The Mac appears in the device list — click **Connect**
+4. The virtual display content streams to the Mac at native resolution
+5. Drag windows onto the virtual display in Windows Display Settings
+
+### Windows architecture
+
+```
+Windows 11 Host                         Mac (Receiver)
+┌─────────────────────┐                ┌─────────────────────┐
+│ VDD Virtual Display  │                │ NWListener :9000    │
+│         ↓            │                │         ↓           │
+│ DXGI Desktop Dup.    │   TCP/WiFi     │ VideoToolbox Decode │
+│         ↓            │ ═══════════>   │         ↓           │
+│ AMF H.264 Encoder    │  Annex B H.264 │ Metal Renderer      │
+│         ↓            │                │         ↓           │
+│ Framed TCP Transport │  <═══════════  │ Mouse/Scroll Input  │
+│         ↓            │  Control JSON  │                     │
+│ SendInput (mouse)    │                └─────────────────────┘
+└─────────────────────┘
+```
+
+All image operations (capture, color conversion, encoding) run on the GPU.
+No CPU is involved in the frame pipeline.
+
 ### Permissions checklist
 
 macOS and iOS gate several things this app needs — most prompt on first use,
@@ -217,6 +289,7 @@ The capture/streaming pipeline itself uses only public APIs.
 |---|---|---|---|---|
 | Price | **Free, open source** | Free | Subscription | $$$ + dongle |
 | iPhone as display | ✅ | ❌ (iPad only) | ✅ | ✅ |
+| Mac as display for Windows | ✅ | ❌ | ❌ | ❌ |
 | Different Apple IDs | ✅ | ❌ | ✅ | ✅ |
 | Wired (USB) | ✅ | ✅ | ✅ | ❌ |
 | True extension | ✅ | ✅ | ✅ | ✅ |
@@ -251,7 +324,7 @@ Tracked as [roadmap issues](https://github.com/peetzweg/opendisplay/issues?q=is%
 - [#14](https://github.com/peetzweg/opendisplay/issues/14) Remote access beyond the local network
 - [#15](https://github.com/peetzweg/opendisplay/issues/15) Additional client platforms
 
-Done: prebuilt releases, built-in USB connectivity (no helper tools), WiFi via Bonjour, portrait mode, touch + two-finger scroll, performance overlay, iPad support, multiple devices at once ([#8](https://github.com/peetzweg/opendisplay/issues/8) — every connected device becomes its own extended display).
+Done: prebuilt releases, built-in USB connectivity (no helper tools), WiFi via Bonjour, portrait mode, touch + two-finger scroll, performance overlay, iPad support, multiple devices at once ([#8](https://github.com/peetzweg/opendisplay/issues/8) — every connected device becomes its own extended display), Windows 11 sender with AMD hardware encoding, Mac receiver mode (use Mac as second display for Windows).
 
 ## Auto-update (macOS app)
 

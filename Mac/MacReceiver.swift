@@ -52,6 +52,8 @@ final class MacReceiver: ObservableObject {
     private var formatDesc: CMVideoFormatDescription?
     private var sps: Data?
     private var pps: Data?
+    private var vps: Data?  // HEVC Video Parameter Set
+    private var isHevc: Bool = false  // Auto-detected from NAL types
     private var renderer: MetalVideoRenderer?
     private var lastKeyframeRequest = Date.distantPast
     private var decodeErrorCount = 0
@@ -239,6 +241,8 @@ final class MacReceiver: ObservableObject {
         self.formatDesc = nil
         self.sps = nil
         self.pps = nil
+        self.vps = nil
+        self.isHevc = false
         self.decodeErrorCount = 0
         DispatchQueue.main.async {
             self.connected = false
@@ -375,32 +379,59 @@ final class MacReceiver: ObservableObject {
             captureMs = meta["cap"] as? Double
         }
 
-        // Categorize NAL units: SPS (type 7), PPS (type 8), VCL slices (type 5 IDR, type 1 non-IDR).
+        // Categorize NAL units.
+        // H.264: SPS=7, PPS=8, IDR=5, non-IDR=1, SEI=6
+        // HEVC:  VPS=32, SPS=33, PPS=34, IDR_W_RADL=19, IDR_N_LP=20, CRA=21, TRAIL=1
+        // NAL type extraction differs: H.264 = first_byte & 0x1F
+        //                              HEVC  = (first_byte >> 1) & 0x3F
         var vclNALUs: [Data] = []
         for nalu in nalus {
             guard let first = nalu.first else { continue }
-            let nalType = first & 0x1F
-            switch nalType {
-            case 7:  // SPS
-                if sps != nalu {
-                    sps = nalu
-                    formatDesc = nil
+
+            // Detect codec from first NAL unit type range
+            // HEVC NAL types 32-34 are parameter sets; H.264 uses 7-8
+            let h264Type = first & 0x1F
+            let hevcType = (first >> 1) & 0x3F
+
+            // Auto-detect: if we see HEVC-range parameter sets, switch to HEVC
+            if hevcType >= 32 && hevcType <= 34 {
+                isHevc = true
+            }
+
+            if isHevc {
+                switch hevcType {
+                case 32: // VPS
+                    if vps != nalu { vps = nalu; formatDesc = nil }
+                case 33: // SPS
+                    if sps != nalu { sps = nalu; formatDesc = nil }
+                case 34: // PPS
+                    if pps != nalu { pps = nalu; formatDesc = nil }
+                case 35, 39, 40: // AUD, SEI prefix, SEI suffix — skip
+                    break
+                default: // VCL slice
+                    vclNALUs.append(nalu)
                 }
-            case 8:  // PPS
-                if pps != nalu {
-                    pps = nalu
-                    formatDesc = nil
+            } else {
+                switch h264Type {
+                case 7:  // SPS
+                    if sps != nalu { sps = nalu; formatDesc = nil }
+                case 8:  // PPS
+                    if pps != nalu { pps = nalu; formatDesc = nil }
+                case 6:  // SEI — skip
+                    break
+                default: // VCL slice (IDR=5, non-IDR=1, etc.)
+                    vclNALUs.append(nalu)
                 }
-            case 6:  // SEI — skip
-                break
-            default: // VCL slice (IDR=5, non-IDR=1, etc.)
-                vclNALUs.append(nalu)
             }
         }
 
-        // Build format description from SPS+PPS if needed.
-        if formatDesc == nil, let sps, let pps {
-            buildFormatDescription(sps: sps, pps: pps)
+        // Build format description if needed
+        if formatDesc == nil {
+            if isHevc, let vps, let sps, let pps {
+                buildHevcFormatDescription(vps: vps, sps: sps, pps: pps)
+            } else if let sps, let pps {
+                buildFormatDescription(sps: sps, pps: pps)
+            }
         }
 
         guard !vclNALUs.isEmpty, let formatDesc else { return }
@@ -480,14 +511,49 @@ final class MacReceiver: ObservableObject {
                 if status == noErr, let desc {
                     self.formatDesc = desc
                     let dims = CMVideoFormatDescriptionGetDimensions(desc)
-                    Log.info("MacReceiver: format description built: \(dims.width)x\(dims.height)")
-                    // Invalidate existing decoder so it's rebuilt for the new format.
+                    Log.info("MacReceiver: H.264 format: \(dims.width)x\(dims.height)")
                     if let session = self.decoder {
                         VTDecompressionSessionInvalidate(session)
                         self.decoder = nil
                     }
                 } else {
-                    Log.info("MacReceiver: format description FAILED: \(status)")
+                    Log.info("MacReceiver: H.264 format description FAILED: \(status)")
+                }
+            }
+        }
+    }
+
+    private func buildHevcFormatDescription(vps: Data, sps: Data, pps: Data) {
+        vps.withUnsafeBytes { vpsBuf in
+            sps.withUnsafeBytes { spsBuf in
+                pps.withUnsafeBytes { ppsBuf in
+                    let ptrs: [UnsafePointer<UInt8>] = [
+                        vpsBuf.bindMemory(to: UInt8.self).baseAddress!,
+                        spsBuf.bindMemory(to: UInt8.self).baseAddress!,
+                        ppsBuf.bindMemory(to: UInt8.self).baseAddress!
+                    ]
+                    let sizes = [vps.count, sps.count, pps.count]
+                    var desc: CMVideoFormatDescription?
+                    let status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: 3,
+                        parameterSetPointers: ptrs,
+                        parameterSetSizes: sizes,
+                        nalUnitHeaderLength: 4,
+                        extensions: nil,
+                        formatDescriptionOut: &desc
+                    )
+                    if status == noErr, let desc {
+                        self.formatDesc = desc
+                        let dims = CMVideoFormatDescriptionGetDimensions(desc)
+                        Log.info("MacReceiver: HEVC format: \(dims.width)x\(dims.height)")
+                        if let session = self.decoder {
+                            VTDecompressionSessionInvalidate(session)
+                            self.decoder = nil
+                        }
+                    } else {
+                        Log.info("MacReceiver: HEVC format description FAILED: \(status)")
+                    }
                 }
             }
         }
