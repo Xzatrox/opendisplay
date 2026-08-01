@@ -25,11 +25,9 @@ static constexpr UINT WM_DEVICES_CHANGED = WM_USER + 3;
 // Child control IDs
 static constexpr int IDC_STATUS_LABEL = 101;
 static constexpr int IDC_DEVICE_LIST = 102;
-static constexpr int IDC_QUALITY_COMBO = 103;
 static constexpr int IDC_CONNECT_BTN = 104;
 static constexpr int IDC_DISCONNECT_BTN = 105;
 static constexpr int IDC_DEVICES_LABEL = 106;
-static constexpr int IDC_QUALITY_LABEL = 107;
 
 MainWindow::MainWindow() = default;
 
@@ -73,7 +71,7 @@ HRESULT MainWindow::Initialize(HINSTANCE hInstance) {
         L"OpenDisplay",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        480, 520,
+        480, 430,
         nullptr,
         nullptr,
         hInstance,
@@ -84,23 +82,41 @@ HRESULT MainWindow::Initialize(HINSTANCE hInstance) {
         return HRESULT_FROM_WIN32(GetLastError());
     }
 
+    // Set the window icon
+    HICON hIcon = static_cast<HICON>(LoadImageW(
+        hInstance, L"IDI_APPICON", IMAGE_ICON, 0, 0,
+        LR_DEFAULTSIZE | LR_SHARED));
+    if (hIcon) {
+        SendMessage(m_hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+        SendMessage(m_hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+    }
+
     // Get the default GUI font
     HFONT hFont = static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
 
     // --- Create child controls ---
 
-    // Status label (top)
-    HWND hStatus = CreateWindowExW(0, L"STATIC", L"Status: Idle",
+    // App title
+    HWND hTitle = CreateWindowExW(0, L"STATIC", L"OpenDisplay",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        20, 15, 430, 20, m_hwnd,
+        20, 12, 200, 22, m_hwnd,
+        nullptr, hInstance, nullptr);
+    HFONT hBoldFont = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    SendMessage(hTitle, WM_SETFONT, (WPARAM)(hBoldFont ? hBoldFont : hFont), TRUE);
+
+    // Status label
+    HWND hStatus = CreateWindowExW(0, L"STATIC", L"Idle",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        20, 36, 430, 18, m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_STATUS_LABEL)),
         hInstance, nullptr);
     SendMessage(hStatus, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    // "Devices" label
-    HWND hDevLabel = CreateWindowExW(0, L"STATIC", L"Devices:",
+    // "Available Devices" label
+    HWND hDevLabel = CreateWindowExW(0, L"STATIC", L"Available Devices",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        20, 45, 430, 18, m_hwnd,
+        20, 64, 430, 18, m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DEVICES_LABEL)),
         hInstance, nullptr);
     SendMessage(hDevLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -108,35 +124,15 @@ HRESULT MainWindow::Initialize(HINSTANCE hInstance) {
     // Device listbox
     HWND hList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-        20, 65, 430, 220, m_hwnd,
+        20, 84, 430, 250, m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DEVICE_LIST)),
         hInstance, nullptr);
     SendMessage(hList, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    // "Quality" label
-    HWND hQualLabel = CreateWindowExW(0, L"STATIC", L"Quality:",
-        WS_CHILD | WS_VISIBLE | SS_LEFT,
-        20, 300, 60, 20, m_hwnd,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_QUALITY_LABEL)),
-        hInstance, nullptr);
-    SendMessage(hQualLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
-
-    // Quality combo box
-    HWND hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
-        85, 297, 200, 120, m_hwnd,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_QUALITY_COMBO)),
-        hInstance, nullptr);
-    SendMessage(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
-    SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Best (18 Mbps)");
-    SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Balanced (10 Mbps)");
-    SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Fast (6 Mbps)");
-    SendMessageW(hCombo, CB_SETCURSEL, 1, 0); // Default: balanced
-
     // Connect button
     HWND hConnect = CreateWindowExW(0, L"BUTTON", L"Connect",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        20, 340, 210, 35, m_hwnd,
+        20, 345, 210, 36, m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_CONNECT_BTN)),
         hInstance, nullptr);
     SendMessage(hConnect, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -144,7 +140,7 @@ HRESULT MainWindow::Initialize(HINSTANCE hInstance) {
     // Disconnect button
     HWND hDisconnect = CreateWindowExW(0, L"BUTTON", L"Disconnect",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-        240, 340, 210, 35, m_hwnd,
+        240, 345, 210, 36, m_hwnd,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DISCONNECT_BTN)),
         hInstance, nullptr);
     SendMessage(hDisconnect, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -308,10 +304,6 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                                L"OpenDisplay", MB_OK | MB_ICONINFORMATION);
                     return 0;
                 }
-                // Get quality selection
-                HWND hCombo = GetDlgItem(m_hwnd, IDC_QUALITY_COMBO);
-                int qualIdx = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
-                OnQualitySelectionChanged(qualIdx);
 
                 // Get device from picker's display list
                 auto devices = m_connectionPicker.GetDisplayList();
@@ -322,20 +314,15 @@ LRESULT MainWindow::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
             else if (controlId == IDC_DISCONNECT_BTN && notifyCode == BN_CLICKED) {
                 OnDisconnectRequested();
             }
-            else if (controlId == IDC_QUALITY_COMBO && notifyCode == CBN_SELCHANGE) {
-                HWND hCombo = GetDlgItem(m_hwnd, IDC_QUALITY_COMBO);
-                int sel = (int)SendMessage(hCombo, CB_GETCURSEL, 0, 0);
-                OnQualitySelectionChanged(sel);
-            }
             return 0;
         }
 
         case WM_SESSION_STATE_CHANGED: {
             // Update status label
             HWND hStatus = GetDlgItem(m_hwnd, IDC_STATUS_LABEL);
-            std::string text = "Status: " + StateToString(m_currentState);
-            if (!m_currentStatus.empty()) {
-                text += " - " + m_currentStatus;
+            std::string text = StateToString(m_currentState);
+            if (!m_currentStatus.empty() && m_currentState != SessionController::State::Idle) {
+                text = m_currentStatus;
             }
             std::wstring wtext(text.begin(), text.end());
             SetWindowTextW(hStatus, wtext.c_str());

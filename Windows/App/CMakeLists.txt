@@ -27,6 +27,7 @@ set(APP_SOURCES
     src/UI/MainWindow.cpp
     src/UI/ConnectionPicker.cpp
     src/dns_sd_stubs.cpp
+    resources/app.rc
 )
 
 # WinUI 3 / Win32 application executable

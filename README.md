@@ -58,9 +58,9 @@ pipeline, USB transport, input injection) are already working.
   like a trackpad. (Apple Pencil support is on the roadmap.)
 - 🔄 **Portrait or landscape** — rotate the device and the virtual display
   rebuilds itself as a vertical monitor at native resolution.
-- ⚡ **Low-latency pipeline** — hardware H.264 encode (VideoToolbox on Mac,
+- ⚡ **Low-latency pipeline** — hardware H.265/HEVC encode (VideoToolbox on Mac,
   AMF on AMD Windows, real-time mode, no B-frames), TCP_NODELAY, frame-drop
-  backpressure with keyframe recovery.
+  backpressure with keyframe recovery. Falls back to H.264 if HEVC unavailable.
 - 🔒 **Self-hosted & private** — your screen never touches anyone's server.
   Two small apps, one TCP connection, that's it.
 
@@ -169,7 +169,7 @@ encoder, and streams to a Mac running OpenDisplay in receiver mode.
 | **Bonjour Print Services** | mDNS/DNS-SD for device discovery | [support.apple.com/kb/DL999](https://support.apple.com/kb/DL999) |
 | **Apple Devices** (Microsoft Store) | USB communication with iOS (AMDS) | Microsoft Store → "Apple Devices" |
 | **Virtual Display Driver** | Creates a virtual monitor on Windows | [github.com/VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver/releases) |
-| **AMD GPU** (RX 5000+) | Hardware H.264 encoding via AMF | AMD driver automatically includes `amfrt64.dll` |
+| **AMD GPU** (RX 5000+) | Hardware H.265/H.264 encoding via AMF | AMD driver automatically includes `amfrt64.dll` |
 
 ### Windows build
 
@@ -210,8 +210,9 @@ Windows 11 Host                         Mac (Receiver)
 │ VDD Virtual Display  │                │ NWListener :9000    │
 │         ↓            │                │         ↓           │
 │ DXGI Desktop Dup.    │   TCP/WiFi     │ VideoToolbox Decode │
-│         ↓            │ ═══════════>   │         ↓           │
-│ AMF H.264 Encoder    │  Annex B H.264 │ Metal Renderer      │
+│         ↓            │ ═══════════>   │  (HEVC or H.264)   │
+│ AMF HEVC/AVC Encoder │  Annex B       │         ↓           │
+│   (GPU hardware)     │                │ Metal Renderer      │
 │         ↓            │                │         ↓           │
 │ Framed TCP Transport │  <═══════════  │ Mouse/Scroll Input  │
 │         ↓            │  Control JSON  │                     │
@@ -219,8 +220,8 @@ Windows 11 Host                         Mac (Receiver)
 └─────────────────────┘
 ```
 
-All image operations (capture, color conversion, encoding) run on the GPU.
-No CPU is involved in the frame pipeline.
+All image operations (capture, color conversion, encoding, decoding, rendering)
+run on GPU hardware. No CPU is involved in the frame pipeline.
 
 ### Permissions checklist
 

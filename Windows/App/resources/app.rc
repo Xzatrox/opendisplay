@@ -1,0 +1,34 @@
+// OpenDisplay Windows App Resource File
+#include <windows.h>
+
+// Application icon (shown in taskbar, title bar, Alt-Tab)
+IDI_APPICON ICON "app.ico"
+
+// Version information
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "OpenDisplay"
+            VALUE "FileDescription",  "OpenDisplay - Second Display for Windows"
+            VALUE "FileVersion",      "1.0.0"
+            VALUE "InternalName",     "OpenDisplay"
+            VALUE "OriginalFilename", "OpenDisplay.exe"
+            VALUE "ProductName",      "OpenDisplay"
+            VALUE "ProductVersion",   "1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
