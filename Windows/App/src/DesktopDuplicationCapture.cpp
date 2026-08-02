@@ -13,7 +13,8 @@
 bool DesktopDuplicationCapture::IsAccessLostError(HRESULT hr)
 {
     return hr == DXGI_ERROR_ACCESS_LOST ||
-           hr == DXGI_ERROR_ACCESS_DENIED;
+           hr == DXGI_ERROR_ACCESS_DENIED ||
+           hr == E_ACCESSDENIED;
 }
 
 // ----------------------------------------------------------------------------

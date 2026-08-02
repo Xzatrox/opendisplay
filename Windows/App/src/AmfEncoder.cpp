@@ -10,6 +10,8 @@
 #include <thread>
 #include <d3d11.h>
 
+#include "Log.h"
+
 // AMF SDK headers
 #include "components/VideoEncoderVCE.h"
 #include "components/VideoEncoderHEVC.h"

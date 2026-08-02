@@ -16,6 +16,7 @@
 #include "BonjourBrowser.h"
 #include "ProtocolHandler.h"
 #include "DriverInterface.h"
+#include "Log.h"
 
 // ─── Static member initialization ────────────────────────────────────────────
 
@@ -401,11 +402,26 @@ bool SessionController::CanStartNewSession()
     return s_activeSessionCount.load() < kMaxSessions;
 }
 
+// ─── Helper: State to string for logging ─────────────────────────────────────
+static std::string StateToString(SessionController::State s) {
+    switch (s) {
+        case SessionController::State::Idle: return "Idle";
+        case SessionController::State::Connecting: return "Connecting";
+        case SessionController::State::WaitingForHello: return "WaitingForHello";
+        case SessionController::State::Streaming: return "Streaming";
+        case SessionController::State::Reconnecting: return "Reconnecting";
+        case SessionController::State::Ended: return "Ended";
+        default: return "Unknown";
+    }
+}
+
 // ─── SessionController: State Management ─────────────────────────────────────
 
 void SessionController::SetState(State newState, const std::string& status)
 {
     State prev = m_state.exchange(newState);
+    Log::Info("State: " + StateToString(prev) + " -> " + StateToString(newState)
+              + (status.empty() ? "" : " (" + status + ")"));
 
     // Track active session count transitions
     bool wasActive = (prev != State::Idle && prev != State::Ended);
@@ -633,19 +649,38 @@ void SessionController::EndSession()
 
 // ─── SessionController: Pipeline Loop ────────────────────────────────────────
 
+// SEH wrapper — must have no C++ objects with destructors
+static int FilterPipelineException(unsigned int code) {
+    char buf[128];
+    sprintf_s(buf, "Pipeline SEH exception 0x%08X", code);
+    Log::Error(buf);
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 void SessionController::PipelineLoop()
 {
-    std::cerr << "[Pipeline] Starting. capture="
-              << (m_capture ? "yes" : "NO")
-              << " amfEncoder=" << (m_amfEncoder ? "yes" : "NO")
-              << " transport=" << (m_transport ? "yes" : "NO") << "\n";
+    try {
+        PipelineLoopInner();
+    } catch (const std::exception& e) {
+        Log::Error(std::string("Pipeline C++ exception: ") + e.what());
+    } catch (...) {
+        Log::Error("Pipeline unknown exception");
+    }
+}
+
+void SessionController::PipelineLoopInner()
+{
+    Log::Info("Pipeline started: capture=" + std::string(m_capture ? "yes" : "NO")
+              + " amfEncoder=" + std::string(m_amfEncoder ? "yes" : "NO")
+              + " transport=" + std::string(m_transport ? "yes" : "NO"));
 
     if (!m_capture || !m_amfEncoder || !m_transport) {
-        std::cerr << "[Pipeline] Missing component. Exiting.\n";
+        Log::Error("Pipeline missing component, exiting");
         return;
     }
 
     int frameCount = 0, sentFrames = 0, loopCount = 0;
+    int captureErrors = 0, encodeErrors = 0, sendErrors = 0;
 
     while (m_pipelineRunning.load()) {
         loopCount++;
@@ -655,8 +690,26 @@ void SessionController::PipelineLoop()
         bool isKeyframe = false;
         HRESULT outHr = m_amfEncoder->GetOutput(annexBData, isKeyframe);
         if (outHr == S_OK && !annexBData.empty()) {
-            m_transport->SendVideoFrame(annexBData, 0, NowMs());
-            sentFrames++;
+            if (m_transport && m_transport->IsConnected()) {
+                HRESULT sendHr = m_transport->SendVideoFrame(annexBData, 0, NowMs());
+                if (SUCCEEDED(sendHr)) {
+                    sentFrames++;
+                } else {
+                    sendErrors++;
+                    if (sendErrors <= 5) {
+                        char buf[128];
+                        sprintf_s(buf, "SendVideoFrame failed: 0x%08X (frame %d)", sendHr, sentFrames);
+                        Log::Error(buf);
+                    }
+                    if (sendErrors > 10) {
+                        Log::Error("Too many send errors, exiting pipeline");
+                        break;
+                    }
+                }
+            } else {
+                Log::Info("Transport disconnected, exiting pipeline (sent=" + std::to_string(sentFrames) + ")");
+                break;
+            }
         }
 
         // Acquire frame from Desktop Duplication
@@ -664,17 +717,62 @@ void SessionController::PipelineLoop()
         DXGI_OUTDUPL_FRAME_INFO frameInfo = {};
         HRESULT hr = m_capture->AcquireFrame(kCaptureTimeoutMs, &texture, &frameInfo);
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-        if (FAILED(hr)) continue;
+        if (FAILED(hr)) {
+            captureErrors++;
+            if (captureErrors <= 5) {
+                char buf[128];
+                sprintf_s(buf, "AcquireFrame failed: 0x%08X (count %d)", hr, captureErrors);
+                Log::Error(buf);
+            }
+            // After 3 consecutive failures, attempt reinitialize
+            if (captureErrors == 3) {
+                Log::Info("Attempting capture reinitialize...");
+                HRESULT reinitHr = m_capture->Reinitialize();
+                if (FAILED(reinitHr)) {
+                    Log::Error("Reinitialize failed, will keep retrying");
+                } else {
+                    Log::Info("Reinitialize succeeded");
+                    captureErrors = 0;
+                }
+            }
+            // After many failures, wait longer before retrying
+            if (captureErrors > 3 && captureErrors <= 300) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            // After 5 minutes of failures (300 * 500ms = 150s), give up
+            if (captureErrors > 300) {
+                Log::Error("Capture failed for too long, exiting pipeline");
+                break;
+            }
+            continue;
+        }
+        captureErrors = 0; // Reset on success
 
         frameCount++;
 
         // Submit BGRA texture directly to AMF (GPU zero-copy)
-        m_amfEncoder->SubmitFrame(texture, NowMs());
+        HRESULT submitHr = m_amfEncoder->SubmitFrame(texture, NowMs());
         m_capture->ReleaseFrame();
+        if (FAILED(submitHr) && submitHr != 0x800401F0L) { // Not MF_E_NOTACCEPTING
+            encodeErrors++;
+            if (encodeErrors <= 5) {
+                char buf[128];
+                sprintf_s(buf, "SubmitFrame failed: 0x%08X (count %d)", submitHr, encodeErrors);
+                Log::Error(buf);
+            }
+        }
     }
 
-    std::cerr << "[Pipeline] Exited. frames=" << frameCount
-              << " sent=" << sentFrames << "\n";
+    if (!m_pipelineRunning.load()) {
+        Log::Info("Pipeline stopped by flag (disconnect/shutdown)");
+    }
+
+    Log::Info("Pipeline exited: loops=" + std::to_string(loopCount)
+              + " frames=" + std::to_string(frameCount)
+              + " sent=" + std::to_string(sentFrames)
+              + " captErr=" + std::to_string(captureErrors)
+              + " encErr=" + std::to_string(encodeErrors)
+              + " sendErr=" + std::to_string(sendErrors));
 }
 
 // ─── SessionController: Hello / Sleep / Close Handlers ───────────────────────
@@ -864,6 +962,7 @@ void SessionController::StopLivenessMonitor()
 
 void SessionController::LivenessLoop()
 {
+    try {
     auto nextPingTime = std::chrono::steady_clock::now() + kPingInterval;
 
     while (m_livenessRunning.load()) {
@@ -896,9 +995,8 @@ void SessionController::LivenessLoop()
         // Check pong timeout (5 seconds without any data received)
         auto elapsed = now - m_lastReceived;
         if (elapsed >= kPongTimeout) {
-            std::cerr << "[SessionController] Liveness timeout: no data received for "
-                      << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()
-                      << " seconds\n";
+            auto secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+            Log::Error("Liveness timeout: no data for " + std::to_string(secs) + "s");
 
             // Transition to Reconnecting state and attempt reconnection
             SetState(State::Reconnecting, "Connection lost, attempting to reconnect...");
@@ -914,6 +1012,9 @@ void SessionController::LivenessLoop()
             }
             return;
         }
+    }
+    } catch (...) {
+        Log::Error("Exception in liveness thread");
     }
 }
 

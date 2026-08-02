@@ -20,6 +20,7 @@
 #include "SessionController.h"
 #include "WireTransport.h"
 #include "UI/MainWindow.h"
+#include "Log.h"
 
 // ─── Forward declarations ────────────────────────────────────────────────────
 
@@ -52,6 +53,26 @@ int WINAPI WinMain(
     // Set DPI awareness BEFORE any DXGI/window creation.
     // Desktop Duplication requires the process to be DPI-aware.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // Initialize file logging
+    Log::Init();
+    Log::Info("OpenDisplay starting");
+
+    // Install a top-level exception handler to catch crashes and show info
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        char buf[256];
+        sprintf_s(buf, "CRASH: exception 0x%08X at 0x%p",
+                  ep->ExceptionRecord->ExceptionCode,
+                  ep->ExceptionRecord->ExceptionAddress);
+        Log::Error(buf);
+        Log::Flush();
+        wchar_t msg[512];
+        swprintf_s(msg, L"OpenDisplay crashed.\n\nException: 0x%08X\nAddress: 0x%p\n\nSee OpenDisplay.log for details.",
+                   ep->ExceptionRecord->ExceptionCode,
+                   ep->ExceptionRecord->ExceptionAddress);
+        MessageBoxW(nullptr, msg, L"OpenDisplay Crash", MB_OK | MB_ICONERROR);
+        return EXCEPTION_EXECUTE_HANDLER;
+    });
 
     // ── Step 1: Initialize COM (apartment-threaded for WinUI/media) ──────────
     if (!InitializeCOM()) {

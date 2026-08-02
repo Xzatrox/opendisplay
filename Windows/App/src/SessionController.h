@@ -125,6 +125,7 @@ private:
 
     /// The capture -> encode -> send pipeline loop (runs on m_pipelineThread).
     void PipelineLoop();
+    void PipelineLoopInner();
 
     /// Liveness monitoring loop (runs on m_livenessThread).
     /// Checks m_lastReceived against kPongTimeout every second.
