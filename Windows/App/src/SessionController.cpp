@@ -694,6 +694,8 @@ void SessionController::PipelineLoopInner()
                 HRESULT sendHr = m_transport->SendVideoFrame(annexBData, 0, NowMs());
                 if (SUCCEEDED(sendHr)) {
                     sentFrames++;
+                    // Successful send proves connection is alive
+                    m_lastReceived = std::chrono::steady_clock::now();
                 } else {
                     sendErrors++;
                     if (sendErrors <= 5) {
@@ -1004,7 +1006,14 @@ void SessionController::LivenessLoop()
 
             // Attempt reconnection on this thread (liveness thread becomes reconnect thread)
             if (AttemptReconnect()) {
+                Log::Info("Reconnected, restarting pipeline");
                 SetState(State::Streaming, "Reconnected successfully");
+                // Wait for old pipeline thread to finish
+                m_pipelineRunning.store(false);
+                if (m_pipelineThread.joinable()) m_pipelineThread.join();
+                // Restart pipeline thread
+                m_pipelineRunning.store(true);
+                m_pipelineThread = std::thread([this]() { PipelineLoop(); });
                 // Restart liveness monitoring in a fresh state
                 StartLivenessMonitor();
             } else {

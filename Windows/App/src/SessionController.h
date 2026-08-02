@@ -203,7 +203,7 @@ private:
     std::thread m_livenessThread;
     std::atomic<bool> m_livenessRunning{false};
     static constexpr auto kPingInterval = std::chrono::seconds(2);
-    static constexpr auto kPongTimeout = std::chrono::seconds(5);
+    static constexpr auto kPongTimeout = std::chrono::seconds(30);
     static constexpr int kMaxReconnectAttempts = 3;
     static constexpr int kReconnectBackoffCapSec = 10;
 
