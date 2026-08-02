@@ -726,26 +726,18 @@ void SessionController::PipelineLoopInner()
                 sprintf_s(buf, "AcquireFrame failed: 0x%08X (count %d)", hr, captureErrors);
                 Log::Error(buf);
             }
-            // After 3 consecutive failures, attempt reinitialize
-            if (captureErrors == 3) {
-                Log::Info("Attempting capture reinitialize...");
+            // Attempt reinitialize every 10 failures (every ~5 seconds)
+            if (captureErrors % 10 == 3) {
                 HRESULT reinitHr = m_capture->Reinitialize();
-                if (FAILED(reinitHr)) {
-                    Log::Error("Reinitialize failed, will keep retrying");
-                } else {
-                    Log::Info("Reinitialize succeeded");
+                if (SUCCEEDED(reinitHr)) {
+                    Log::Info("Capture reinitialized successfully after " + std::to_string(captureErrors) + " errors");
                     captureErrors = 0;
+                    continue;
                 }
             }
-            // After many failures, wait longer before retrying
-            if (captureErrors > 3 && captureErrors <= 300) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-            // After 5 minutes of failures (300 * 500ms = 150s), give up
-            if (captureErrors > 300) {
-                Log::Error("Capture failed for too long, exiting pipeline");
-                break;
-            }
+            // Wait 500ms between retries to avoid spinning
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            // Never give up — keep retrying indefinitely (display will come back)
             continue;
         }
         captureErrors = 0; // Reset on success
